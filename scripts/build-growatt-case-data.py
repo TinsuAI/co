@@ -28,6 +28,7 @@ DEFAULT_XK_REPORT = Path(
     "data/extracted/Growatt-20260421/Growatt/BaoCaoHangChiTietXK GRW T3-T4.2026 moi.xls"
 )
 DEFAULT_CASE_DIR = Path("data/cases/growatt-rvc-20260421/shared")
+DEFAULT_USD_FX_WORKBOOK = Path("data/reference/DS_ty_gia_ngoai_te.xlsx")
 ERP_CODE_RE = re.compile(r"^[A-Z0-9]+(?:\.[A-Z0-9]+)+(?:-[A-Z0-9-]+)?$")
 
 
@@ -37,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nk-report", type=Path, default=DEFAULT_NK_REPORT)
     parser.add_argument("--xk-report", type=Path, default=DEFAULT_XK_REPORT)
     parser.add_argument("--case-dir", type=Path, default=DEFAULT_CASE_DIR)
+    parser.add_argument("--usd-fx-workbook", type=Path, default=DEFAULT_USD_FX_WORKBOOK)
     return parser.parse_args()
 
 
@@ -51,6 +53,13 @@ def clean_text(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def parse_float(value: object) -> float:
+    text = clean_text(value)
+    if not text:
+        return 0.0
+    return float(text)
 
 
 def make_line_key(declaration_no: object, declaration_item_no: object) -> str:
@@ -81,6 +90,92 @@ def to_date(value: object, datemode: int | None = None) -> date | None:
 
 def looks_like_erp_code(text: str) -> bool:
     return bool(text and ERP_CODE_RE.match(text))
+
+
+def parse_vnd_rate_text(value: object) -> float:
+    digits = re.sub(r"[^0-9]", "", clean_text(value))
+    if not digits:
+        return 0.0
+    return float(digits)
+
+
+def load_usd_customs_rates(path: Path) -> list[tuple[date, float]]:
+    if not path.exists():
+        return []
+    workbook = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    rows: list[tuple[date, float]] = []
+    for row in sheet.iter_rows(min_row=3, values_only=True):
+        if clean_text(row[0]).upper() != "USD":
+            continue
+        effective_date = to_date(row[2])
+        rate_value = parse_vnd_rate_text(row[3])
+        if effective_date is None or rate_value <= 0:
+            continue
+        rows.append((effective_date, rate_value))
+    rows.sort(key=lambda item: item[0])
+    return rows
+
+
+def lookup_usd_customs_rate(declaration_date: date | None, usd_customs_rates: list[tuple[date, float]]) -> float | None:
+    if declaration_date is None:
+        return None
+    applicable_rate: float | None = None
+    for effective_date, rate_value in usd_customs_rates:
+        if effective_date <= declaration_date:
+            applicable_rate = rate_value
+            continue
+        break
+    return applicable_rate
+
+
+def normalize_price_fields(
+    raw_unit_price: object,
+    tax_unit_price: object,
+    source_exchange_rate: object,
+    declaration_date: date | None,
+    usd_customs_rates: list[tuple[date, float]],
+) -> dict[str, object]:
+    raw_value = parse_float(raw_unit_price)
+    tax_value = parse_float(tax_unit_price)
+    source_rate = parse_float(source_exchange_rate)
+    customs_usd_rate = lookup_usd_customs_rate(declaration_date, usd_customs_rates)
+
+    if tax_value > 0 and customs_usd_rate:
+        return {
+            "source_unit_price": raw_value,
+            "unit_price_usd": tax_value / customs_usd_rate,
+            "tax_unit_price": tax_value,
+            "exchange_rate": customs_usd_rate,
+            "source_exchange_rate": source_rate,
+            "price_normalization_basis": "tax_vnd_over_customs_usd_rate",
+        }
+    if tax_value > 0 and source_rate > 1:
+        return {
+            "source_unit_price": raw_value,
+            "unit_price_usd": tax_value / source_rate,
+            "tax_unit_price": tax_value,
+            "exchange_rate": source_rate,
+            "source_exchange_rate": source_rate,
+            "price_normalization_basis": "tax_vnd_over_source_exchange_rate",
+        }
+    if raw_value > 0:
+        return {
+            "source_unit_price": raw_value,
+            "unit_price_usd": raw_value,
+            "tax_unit_price": tax_value,
+            "exchange_rate": customs_usd_rate or source_rate,
+            "source_exchange_rate": source_rate,
+            "price_normalization_basis": "raw_unit_price_field",
+        }
+    return {
+        "source_unit_price": raw_value,
+        "unit_price_usd": 0.0,
+        "tax_unit_price": tax_value,
+        "exchange_rate": customs_usd_rate or source_rate,
+        "source_exchange_rate": source_rate,
+        "price_normalization_basis": "missing_price",
+    }
 
 
 def split_name_parts(name: str) -> tuple[str, str]:
@@ -315,7 +410,7 @@ def load_xk_rows(report_path: Path) -> list[dict[str, object]]:
     return rows
 
 
-def load_bcct_nk_rows(report_path: Path) -> list[dict[str, object]]:
+def load_bcct_nk_rows(report_path: Path, usd_customs_rates: list[tuple[date, float]]) -> list[dict[str, object]]:
     book = xlrd.open_workbook(str(report_path))
     sheet = book.sheet_by_index(0)
     rows: list[dict[str, object]] = []
@@ -326,12 +421,14 @@ def load_bcct_nk_rows(report_path: Path) -> list[dict[str, object]]:
         if not declared_code and not name:
             continue
         name_fields = derive_name_fields(name, declared_code)
+        declaration_date = to_date(row[2], book.datemode)
+        price_fields = normalize_price_fields(row[24], row[25], row[10], declaration_date, usd_customs_rates)
         rows.append(
             {
                 "source": "BCCT_NK",
                 "source_row_no": row_idx + 1,
                 "declaration_no": str(int(row[1])),
-                "declaration_date": to_date(row[2], book.datemode),
+                "declaration_date": declaration_date,
                 "declaration_item_no": int(row[19]),
                 "tracking_key": make_line_key(int(row[1]), int(row[19])),
                 "declared_code": declared_code,
@@ -339,21 +436,19 @@ def load_bcct_nk_rows(report_path: Path) -> list[dict[str, object]]:
                 "hs_code": clean_text(row[21]),
                 "name": name,
                 "origin": clean_text(row[23]),
-                "unit_price_usd": float(row[24] or 0),
-                "tax_unit_price": float(row[25] or 0),
                 "import_qty": float(row[26] or 0),
                 "unit": clean_text(row[27]),
                 "partner_name": clean_text(row[49]),
                 "invoice_no": clean_text(row[50]),
                 "invoice_date": to_date(row[51], book.datemode),
-                "exchange_rate": float(row[10] or 0),
+                **price_fields,
                 **name_fields,
             }
         )
     return rows
 
 
-def load_nk2_rows(workbook_path: Path) -> list[dict[str, object]]:
+def load_nk2_rows(workbook_path: Path, usd_customs_rates: list[tuple[date, float]]) -> list[dict[str, object]]:
     workbook = openpyxl.load_workbook(
         workbook_path,
         data_only=True,
@@ -368,12 +463,14 @@ def load_nk2_rows(workbook_path: Path) -> list[dict[str, object]]:
         if not declared_code and not name:
             continue
         name_fields = derive_name_fields(name, declared_code)
+        declaration_date = to_date(row[1])
+        price_fields = normalize_price_fields(row[8], row[9], row[15], declaration_date, usd_customs_rates)
         rows.append(
             {
                 "source": "NK2",
                 "source_row_no": row_no,
                 "declaration_no": str(int(row[0])),
-                "declaration_date": to_date(row[1]),
+                "declaration_date": declaration_date,
                 "declaration_item_no": int(row[3]),
                 "tracking_key": make_line_key(int(row[0]), int(row[3])),
                 "declared_code": declared_code,
@@ -381,16 +478,14 @@ def load_nk2_rows(workbook_path: Path) -> list[dict[str, object]]:
                 "hs_code": clean_text(row[5]),
                 "name": name,
                 "origin": clean_text(row[7]),
-                "unit_price_usd": float(row[8] or 0),
-                "tax_unit_price": float(row[9] or 0),
                 "import_qty": float(row[10] or 0),
                 "unit": clean_text(row[11]),
                 "partner_name": clean_text(row[12]),
                 "invoice_no": clean_text(row[13]),
                 "invoice_date": to_date(row[14]),
-                "exchange_rate": float(row[15] or 0),
                 "used_qty": float(row[16] or 0),
                 "remaining_qty": float(row[17] or 0),
+                **price_fields,
                 **name_fields,
             }
         )
@@ -486,9 +581,10 @@ def main() -> None:
     dm_rows = load_dm_variants(args.workbook)
     dm_codes = {clean_text(row["bom_code"]) for row in dm_rows} | {clean_text(row["material_code"]) for row in dm_rows}
     dm_family_codes = {clean_text(row["product_family_code"]) for row in dm_rows}
+    usd_customs_rates = load_usd_customs_rates(args.usd_fx_workbook)
     export_rows = load_xk_rows(args.xk_report)
-    bcct_nk_rows = load_bcct_nk_rows(args.nk_report)
-    nk2_rows = load_nk2_rows(args.workbook)
+    bcct_nk_rows = load_bcct_nk_rows(args.nk_report, usd_customs_rates)
+    nk2_rows = load_nk2_rows(args.workbook, usd_customs_rates)
     annotate_lookup_resolution(
         export_rows,
         "internal_code_for_dm",
@@ -520,20 +616,26 @@ def main() -> None:
     export_dm_match_counts = Counter(row["dm_match_status"] for row in export_rows)
     export_mapping_counts = Counter(row["mapping_status"] for row in export_rows)
     stock_mapping_counts = Counter(row["mapping_status"] for row in updated_stock_rows)
+    import_price_basis_counts = Counter(row["price_normalization_basis"] for row in bcct_nk_rows)
+    stock_price_basis_counts = Counter(row["price_normalization_basis"] for row in updated_stock_rows)
 
     manifest = {
         "generated_at": datetime.now().isoformat(),
         "workbook": str(args.workbook),
         "nk_report": str(args.nk_report),
         "xk_report": str(args.xk_report),
+        "usd_fx_workbook": str(args.usd_fx_workbook) if args.usd_fx_workbook else "",
+        "usd_fx_rate_rows": len(usd_customs_rates),
         **stats,
         "import_code_extraction_counts": dict(import_extraction_counts),
         "import_dm_match_counts": dict(import_dm_match_counts),
         "import_mapping_counts": dict(import_mapping_counts),
+        "import_price_basis_counts": dict(import_price_basis_counts),
         "export_code_extraction_counts": dict(export_extraction_counts),
         "export_dm_match_counts": dict(export_dm_match_counts),
         "export_mapping_counts": dict(export_mapping_counts),
         "stock_mapping_counts": dict(stock_mapping_counts),
+        "stock_price_basis_counts": dict(stock_price_basis_counts),
     }
 
     stock_fields = [
@@ -557,8 +659,10 @@ def main() -> None:
         "name",
         "description_clean",
         "origin",
+        "source_unit_price",
         "unit_price_usd",
         "tax_unit_price",
+        "price_normalization_basis",
         "import_qty",
         "used_qty",
         "remaining_qty",
@@ -567,6 +671,7 @@ def main() -> None:
         "invoice_no",
         "invoice_date",
         "exchange_rate",
+        "source_exchange_rate",
         "nk2_source_row_no",
         "bcct_source_row_no",
     ]
@@ -592,14 +697,17 @@ def main() -> None:
         "name",
         "description_clean",
         "origin",
+        "source_unit_price",
         "unit_price_usd",
         "tax_unit_price",
+        "price_normalization_basis",
         "import_qty",
         "unit",
         "partner_name",
         "invoice_no",
         "invoice_date",
         "exchange_rate",
+        "source_exchange_rate",
     ]
     export_fields = [
         "source_row_no",

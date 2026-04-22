@@ -1,57 +1,39 @@
 # Project Status
 
 ## Current State
-- Active work is on branch `case/growatt-rvc-20260421` for the Growatt RVC case, focused on unfinished shipments `GIN01426B282` and `GIN01426C171`.
-- A case plan now exists in [docs/growatt-rvc-case-execution-plan.md](/home/vp/workspace/client/barry-CO/docs/growatt-rvc-case-execution-plan.md), and the repo has case scripts for baseline evaluation, normalized data building, and result rendering.
-- Shared normalized case data is now built under `data/cases/growatt-rvc-20260421/shared/normalized/` from workbook `DM`/`NK2` plus BCCT import/export reports.
-- Import/customs-line identity has been corrected to `declaration_no + declaration_item_no`; the merged stock ledger no longer duplicates the same customs line when BCCT and `NK2` use different code representations.
-- Code extraction is now stateful:
-  - `lookup_material_code` / `internal_code_for_dm` are candidate codes only
-  - `confirmed_lookup_code` is filled only when confirmation is defensible
-  - `final_lookup_key` is filled only for confirmed rows
-- Current import normalization status:
-  - `3045` BCCT import rows total
-  - `904` confirmed rows
-  - `792` confirmed via same customs line from `NK2`
-  - `1738` still `candidate_exact_dm_match`
-  - `228` still `candidate_not_in_dm`
-  - `175` still `no_lookup_code`
-- Current merged stock ledger status:
-  - `33065` rows in `co-stock-tracking-updated.csv`
-  - `0` duplicate customs-line keys
-- The old baseline runner is still not trustworthy for decision-making yet because it still reads raw workbook `NK2` directly instead of the normalized shared stock ledger and still lacks the new admissibility layer.
+- Active work remains on branch `case/growatt-rvc-20260421`, but the `B282` case pipeline is now materially more trustworthy than the previous workbook-driven baseline.
+- Shared normalized case data under `data/cases/growatt-rvc-20260421/shared/normalized/` now carries USD-normalized valuation fields with explicit audit basis, plus the prior candidate-vs-confirmed code-state split.
+- `B282` now has shipment-specific admissibility artifacts in `data/cases/growatt-rvc-20260421/b282/normalized/`, and the baseline runner now consumes shared normalized CSVs plus admissibility instead of raw `NK2`.
+- Import-age policy is now explicit and configurable:
+  - latest import date allowed: `export_date - 2 days`
+  - oldest import date allowed by default: `export_date - 365 days`
+- Current `B282` output is still a failure, but it is now based on normalized inputs, variant-scoped admissibility, and explicit stock-age limits:
+  - best scenario `total_unmet_qty = 10807.002139`
+  - best scenario `min_margin = -7.132388635440243`
+- `BCCT` import evidence for this Growatt case is only `2026`; older `2023-2024` dates in the merged stock ledger come from `NK2` carry-over stock, not the current BCCT import report.
 
 ## Recent Changes
-- Added Growatt case plan doc and linked it from `docs/README.md`.
-- Added [scripts/growatt-rvc-baseline.py](/home/vp/workspace/client/barry-CO/scripts/growatt-rvc-baseline.py) to enumerate `DM` BOM blocks as `bom_variant_id` scenarios and run shipment-level allocation/RVC baselines.
-- Added [scripts/render-growatt-case-view.py](/home/vp/workspace/client/barry-CO/scripts/render-growatt-case-view.py) to produce summary markdown/CSV views for case results.
-- Added [scripts/build-growatt-case-data.py](/home/vp/workspace/client/barry-CO/scripts/build-growatt-case-data.py) to build shared normalized data from workbook + BCCT reports.
-- Refined normalization so candidate-vs-confirmed code states are explicit and import rows can inherit confirmation from `NK2` only when the same customs line has one unambiguous confirmed code.
-- Critic reviews established that the next logic layer must be `variant-scoped admissibility`, not shipment-wide confirmation.
+- Added [scripts/build-growatt-shipment-admissibility.py](/home/vp/workspace/client/barry-CO/scripts/build-growatt-shipment-admissibility.py) to derive variant-scoped `B282` admissibility, coverage, and ambiguity artifacts from shared normalized data.
+- Rewrote [scripts/growatt-rvc-baseline.py](/home/vp/workspace/client/barry-CO/scripts/growatt-rvc-baseline.py) to:
+  - read normalized exports / stock instead of raw workbook sheets
+  - gate candidate rows through shipment-specific admissibility artifacts
+  - apply configurable import lead-time and max-age rules
+- Extended [scripts/build-growatt-case-data.py](/home/vp/workspace/client/barry-CO/scripts/build-growatt-case-data.py) so import-side valuation is normalized to USD with an explicit `price_normalization_basis`.
+- Added [scripts/download-customs-fx-rates.py](/home/vp/workspace/client/barry-CO/scripts/download-customs-fx-rates.py) to refresh customs FX data directly from `customs.gov.vn`.
+- Rebuilt shared normalized data, rebuilt `B282` admissibility and baseline outputs, and added [docs/growatt-valuation-and-stock-insights.md](/home/vp/workspace/client/barry-CO/docs/growatt-valuation-and-stock-insights.md) to preserve the valuation and stock-aging findings.
 
 ## Next Steps
-- Build a `B282`-specific admissibility layer without mutating shared normalized data.
-- Produce artifacts at least equivalent to:
-  - `b282-variant-admissibility.csv`
-  - `b282-material-coverage.csv`
-  - `b282-ambiguity-report.csv`
-- Make admissibility state variant-scoped (`admissible_for_variant` / ambiguous), not shipment-scoped confirmation.
-- Repoint the baseline runner to consume shared normalized data instead of raw `NK2`.
-- Ensure allocation uses only `confirmed_*` or explicit variant-admissible rows, never raw `candidate_*`.
-- Only after `B282` scenario logic is defensible should work continue to `C171`.
-
-## Blockers
-- The remaining `1966` unresolved import rows cannot be auto-confirmed further by same-customs-line matching to `NK2`; they need variant-scoped admissibility logic or manual review.
-- Baseline/RVC outputs already generated for `B282` are provisional/stale because they were computed before the normalized stock/reconciliation corrections were integrated into the runner.
+- Review the `B282` failure outputs by material group and separate true stock shortages from date-window exclusions.
+- Decide whether the default `365`-day inventory window is the final business rule or only the current operational default.
+- If `B282` logic is accepted, repeat the same pipeline for `C171`.
 
 ## Notes for Next AI Session
 - User wants the work grounded in operational data, not blind trust in the macro workbook. Workbook columns and formulas are often manually overwritten and should be treated cautiously.
-- `DM` should be modeled as layered identity:
-  - `export_product_code`
-  - `bom_code`
-  - `bom_variant_id`
-  - optional `product_family_code`
-- Growatt names often contain both customs-facing code and internal ERP code. Keep raw `declared_code`, extracted candidate code, and confirmed code separate.
-- User explicitly wants sequence, not parallel shipment processing: `B282` first, then `C171`.
-- Import eligibility rule is currently `import_date <= export_date - 2 days`.
-- Critic review result to preserve: do not “confirm for shipment”; preserve ambiguity as data and adjudicate against explicit `bom_variant_id` scope.
+- User explicitly wanted the stock-age rule configurable, with the default set to “within the last year, and at least 2 days before export”.
+- Preserve the valuation distinction:
+  - customs-workbook USD conversion is preferred
+  - source exchange rate is fallback only
+  - raw unit price is last fallback
+- Current customs FX workbook lives at `data/reference/DS_ty_gia_ngoai_te.xlsx` and is local-only; refresh it with `python3 scripts/download-customs-fx-rates.py`.
+- `B282` currently has `756` ambiguity rows, `27963` variant-admissibility rows, and `3884` material-coverage rows.
+- There is still a large amount of old `NK2` stock on the ledger, but under the default one-year window the current best `B282` scenario uses none of the `2023-2024` rows.

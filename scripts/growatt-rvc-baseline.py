@@ -3,35 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from itertools import product
 from pathlib import Path
-from zipfile import ZipFile
-
-import openpyxl
-import xlrd
 
 
-NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-DEFAULT_WORKBOOK = Path(
-    "data/extracted/Growatt-20260421/Growatt/"
-    "tru lui CO final  SXXK - 2025 commercial-MAC - Huyền đúng.xlsm"
-)
-DEFAULT_XK_REPORT = Path(
-    "data/extracted/Growatt-20260421/Growatt/BaoCaoHangChiTietXK GRW T3-T4.2026 moi.xls"
-)
 DEFAULT_CASE_DIR = Path("data/cases/growatt-rvc-20260421")
-DEFAULT_SHIPMENTS = ("GIN01426B282", "GIN01426C171")
+DEFAULT_SHIPMENTS = ("GIN01426B282",)
 TARGET_RVC = 35.0
-MODEL_RE = re.compile(r"\((PV[^)]+)\)")
 VN_ORIGINS = {"VIETNAM", "VIỆT NAM", "VN"}
 IMPORT_LEAD_DAYS = 2
+MAX_IMPORT_AGE_DAYS = 365
 
 
 @dataclass
@@ -73,7 +61,8 @@ class BomVariant:
 @dataclass
 class StockBucket:
     bucket_id: str
-    sheet_row_no: int
+    tracking_key: str
+    source: str
     declaration_no: str
     declaration_item_no: int
     import_date: date | None
@@ -84,6 +73,8 @@ class StockBucket:
     unit_price_usd: float
     exchange_rate: float
     remaining_qty: float
+    admissibility_status: str
+    admissible_variant_ids: frozenset[str]
 
 
 @dataclass
@@ -96,6 +87,7 @@ class SourceAllocation:
     unit_price_usd: float
     exchange_rate: float
     origin: str
+    admissibility_status: str
 
 
 @dataclass
@@ -161,6 +153,47 @@ class ShipmentScenarioResult:
         return sum(item.unmet_qty_total for item in self.product_results)
 
 
+def clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def parse_numeric(value: object) -> float:
+    text = clean_text(value)
+    if not text:
+        return 0.0
+    return float(text)
+
+
+def parse_int(value: object) -> int:
+    text = clean_text(value)
+    if not text:
+        return 0
+    return int(float(text))
+
+
+def to_date(value: object) -> date | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, date):
+        return value
+    text = clean_text(value)
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def shipment_slug(shipment_id: str) -> str:
+    match = re.search(r"([A-Z]\d{3,})$", shipment_id)
+    if match:
+        return match.group(1).lower()
+    return shipment_id.lower().replace("/", "-")
+
+
 def normalize_origin(origin: str | None) -> str:
     if origin is None:
         return ""
@@ -171,203 +204,190 @@ def is_vietnam_origin(origin: str | None) -> bool:
     return normalize_origin(origin) in VN_ORIGINS
 
 
-def parse_numeric(value: object) -> float:
-    if value in (None, ""):
-        return 0.0
-    return float(value)
+def load_dm_variants(normalized_dir: Path) -> tuple[list[BomVariant], dict[str, list[BomVariant]]]:
+    rows_by_variant: dict[str, list[dict[str, str]]] = defaultdict(list)
+    with (normalized_dir / "dm-variants.csv").open(encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            rows_by_variant[clean_text(row["bom_variant_id"])].append(row)
 
-
-def to_date(value: object, datemode: int | None = None) -> date | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    if isinstance(value, (int, float)) and datemode is not None:
-        try:
-            return datetime(*xlrd.xldate_as_tuple(value, datemode)).date()
-        except Exception:
-            return None
-    if isinstance(value, str):
-        text = value.strip()
-        for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y"):
-            try:
-                return datetime.strptime(text, fmt).date()
-            except ValueError:
-                continue
-    return None
-
-
-def load_shared_strings(archive: ZipFile) -> list[str]:
-    root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
-    strings: list[str] = []
-    for si in root.findall(f"{NS}si"):
-        strings.append("".join(text.text or "" for text in si.iter(f"{NS}t")))
-    return strings
-
-
-def cell_value(cell: ET.Element, shared_strings: list[str]) -> str | None:
-    raw = cell.find(f"{NS}v")
-    if raw is None:
-        return None
-    value = raw.text or ""
-    if cell.attrib.get("t") == "s":
-        return shared_strings[int(value)]
-    return value
-
-
-def load_dm_variants(workbook_path: Path) -> tuple[list[BomVariant], dict[str, list[BomVariant]]]:
     variants: list[BomVariant] = []
     variants_by_model: dict[str, list[BomVariant]] = defaultdict(list)
-
-    with ZipFile(workbook_path) as archive:
-        shared_strings = load_shared_strings(archive)
-        rows: list[tuple[int, str, str, float]] = []
-        for _, elem in ET.iterparse(archive.open("xl/worksheets/sheet4.xml"), events=("end",)):
-            if elem.tag != f"{NS}row":
-                continue
-            row_no = int(elem.attrib["r"])
-            if row_no < 7:
-                elem.clear()
-                continue
-            values: dict[str, str | None] = {}
-            for cell in elem.findall(f"{NS}c"):
-                ref = cell.attrib["r"]
-                col = "".join(ch for ch in ref if ch.isalpha())
-                values[col] = cell_value(cell, shared_strings)
-            model_code = values.get("A")
-            ordinal_key = values.get("B")
-            material_code = values.get("F")
-            qty_raw = values.get("I")
-            if model_code and material_code and qty_raw not in (None, ""):
-                rows.append((row_no, str(model_code), str(ordinal_key or ""), str(material_code), float(qty_raw)))
-            elem.clear()
-
-    block_counts: dict[str, int] = defaultdict(int)
-    current_model = None
-    current_rows: list[tuple[int, str, str, float]] = []
-
-    def flush_current() -> None:
-        nonlocal current_rows, current_model
-        if not current_model or not current_rows:
-            current_rows = []
-            current_model = None
-            return
-        block_counts[current_model] += 1
-        block_index = block_counts[current_model]
-        variant_id = f"{current_model}__block{block_index}"
+    for variant_id, rows in rows_by_variant.items():
+        rows.sort(key=lambda item: parse_int(item["dm_row_no"]))
+        bom_code = clean_text(rows[0]["bom_code"])
         lines = [
-            BomLine(material_code=material_code, qty_per_unit=qty_per_unit, row_no=row_no, ordinal_key=ordinal_key)
-            for row_no, _, ordinal_key, material_code, qty_per_unit in current_rows
+            BomLine(
+                material_code=clean_text(row["material_code"]),
+                qty_per_unit=parse_numeric(row["qty_per_unit"]),
+                row_no=parse_int(row["dm_row_no"]),
+                ordinal_key=clean_text(row["ordinal_key"]),
+            )
+            for row in rows
         ]
+        block_match = re.search(r"__block(\d+)$", variant_id)
+        block_index = int(block_match.group(1)) if block_match else 1
         variant = BomVariant(
             variant_id=variant_id,
-            model_code=current_model,
-            bom_code=current_model,
+            model_code=clean_text(rows[0]["product_family_code"]),
+            bom_code=bom_code,
             block_index=block_index,
-            start_row=current_rows[0][0],
-            end_row=current_rows[-1][0],
+            start_row=lines[0].row_no,
+            end_row=lines[-1].row_no,
             line_count=len(lines),
             lines=lines,
         )
         variants.append(variant)
-        variants_by_model[current_model].append(variant)
-        current_rows = []
-        current_model = None
+        variants_by_model[variant.model_code].append(variant)
 
-    for row_no, model_code, ordinal_key, material_code, qty_per_unit in rows:
-        if model_code != current_model:
-            flush_current()
-            current_model = model_code
-        current_rows.append((row_no, model_code, ordinal_key, material_code, qty_per_unit))
-    flush_current()
-
+    for items in variants_by_model.values():
+        items.sort(key=lambda item: (item.bom_code, item.block_index))
     return variants, variants_by_model
 
 
-def load_export_rows(report_path: Path, shipment_ids: set[str]) -> dict[str, list[ExportLine]]:
-    book = xlrd.open_workbook(str(report_path))
-    sheet = book.sheet_by_index(0)
+def load_export_rows(normalized_dir: Path, shipment_ids: set[str]) -> dict[str, list[ExportLine]]:
     shipments: dict[str, list[ExportLine]] = defaultdict(list)
-
-    for row_idx in range(10, sheet.nrows):
-        row = sheet.row_values(row_idx)
-        shipment_id = str(row[50]).strip()
-        if shipment_id not in shipment_ids:
-            continue
-        name = str(row[22]).strip()
-        match = MODEL_RE.search(name)
-        if not match:
-            continue
-        shipments[shipment_id].append(
-            ExportLine(
-                shipment_id=shipment_id,
-                declaration_no=str(int(row[1])),
-                declaration_item_no=int(row[19]),
-                export_row_no=row_idx + 1,
-                export_date=to_date(row[2], book.datemode) or date.min,
-                internal_code=str(row[20]).strip(),
-                model_code=match.group(1),
-                hs_code=str(row[21]).strip(),
-                quantity=float(row[26]),
-                unit_price_usd=float(row[24]),
-                incoterm=str(row[17]).strip().upper(),
-                name=name,
+    with (normalized_dir / "exports-normalized.csv").open(encoding="utf-8") as handle:
+        for row_idx, row in enumerate(csv.DictReader(handle), start=2):
+            shipment_id = clean_text(row["shipment_id"])
+            if shipment_id not in shipment_ids:
+                continue
+            model_code = clean_text(row["final_lookup_key"])
+            export_date = to_date(row["declaration_date"]) or to_date(row["invoice_date"])
+            if not model_code or export_date is None:
+                continue
+            shipments[shipment_id].append(
+                ExportLine(
+                    shipment_id=shipment_id,
+                    declaration_no=clean_text(row["declaration_no"]),
+                    declaration_item_no=parse_int(row["declaration_item_no"]),
+                    export_row_no=row_idx,
+                    export_date=export_date,
+                    internal_code=clean_text(row["declared_code"]),
+                    model_code=model_code,
+                    hs_code=clean_text(row["hs_code"]),
+                    quantity=parse_numeric(row["quantity"]),
+                    unit_price_usd=parse_numeric(row["unit_price_usd"]),
+                    incoterm=clean_text(row["incoterm"]).upper(),
+                    name=clean_text(row["name"]),
+                )
             )
-        )
 
     for shipment_id in shipments:
         shipments[shipment_id].sort(key=lambda item: (item.declaration_no, item.declaration_item_no, item.export_row_no))
     return shipments
 
 
-def load_nk2_stock(workbook_path: Path) -> dict[str, list[StockBucket]]:
-    workbook = openpyxl.load_workbook(
-        workbook_path,
-        data_only=True,
-        read_only=True,
-        keep_vba=True,
-    )
-    sheet = workbook["NK2"]
+def load_candidate_admissibility(case_dir: Path, shipment_id: str) -> dict[tuple[str, str], set[str]]:
+    slug = shipment_slug(shipment_id)
+    admissibility_path = case_dir / slug / "normalized" / f"{slug}-variant-admissibility.csv"
+    if not admissibility_path.exists():
+        raise SystemExit(f"Missing admissibility artifact: {admissibility_path}")
+
+    candidate_variants: dict[tuple[str, str], set[str]] = defaultdict(set)
+    with admissibility_path.open(encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if clean_text(row["admissibility_status"]) != "admissible_candidate_for_variant":
+                continue
+            key = (
+                clean_text(row["tracking_key"]),
+                clean_text(row["admissible_material_code"]),
+            )
+            candidate_variants[key].add(clean_text(row["variant_id"]))
+    return candidate_variants
+
+
+def load_stock_snapshot(normalized_dir: Path, candidate_admissibility: dict[tuple[str, str], set[str]]) -> dict[str, list[StockBucket]]:
     stock_by_code: dict[str, list[StockBucket]] = defaultdict(list)
-    for row_no, row in enumerate(sheet.iter_rows(min_row=5, values_only=True), start=5):
-        material_code = row[4]
-        if material_code is None:
-            continue
-        remaining_qty = parse_numeric(row[17])
-        if remaining_qty <= 0:
-            continue
-        bucket = StockBucket(
-            bucket_id=f"{int(row[0])}-{int(row[3])}-{str(material_code).strip()}-{row_no}",
-            sheet_row_no=row_no,
-            declaration_no=str(int(row[0])),
-            declaration_item_no=int(row[3]),
-            import_date=to_date(row[1]),
-            material_code=str(material_code).strip(),
-            hs_code=str(row[5]).strip() if row[5] is not None else "",
-            name=str(row[6] or "").strip(),
-            origin=str(row[7] or "").strip(),
-            unit_price_usd=float(row[8] or 0),
-            exchange_rate=float(row[15] or 0),
-            remaining_qty=remaining_qty,
+    with (normalized_dir / "co-stock-tracking-updated.csv").open(encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            remaining_qty = parse_numeric(row["remaining_qty"])
+            if remaining_qty <= 0:
+                continue
+
+            tracking_key = clean_text(row["tracking_key"])
+            confirmed_code = clean_text(row["confirmed_lookup_code"])
+            candidate_code = clean_text(row["lookup_material_code"])
+            mapping_status = clean_text(row["mapping_status"])
+
+            admissibility_status = ""
+            admissible_variant_ids: frozenset[str] = frozenset()
+            material_code = ""
+
+            if confirmed_code:
+                material_code = confirmed_code
+                admissibility_status = "confirmed_for_variant"
+            elif mapping_status == "candidate_exact_dm_match":
+                allowed_variants = candidate_admissibility.get((tracking_key, candidate_code), set())
+                if not allowed_variants:
+                    continue
+                material_code = candidate_code
+                admissibility_status = "admissible_candidate_for_variant"
+                admissible_variant_ids = frozenset(sorted(allowed_variants))
+            else:
+                continue
+
+            source_row_hint = clean_text(row["nk2_source_row_no"]) or clean_text(row["bcct_source_row_no"]) or "na"
+            bucket = StockBucket(
+                bucket_id=f"{tracking_key}-{material_code}-{source_row_hint}",
+                tracking_key=tracking_key,
+                source=clean_text(row["source"]),
+                declaration_no=clean_text(row["declaration_no"]),
+                declaration_item_no=parse_int(row["declaration_item_no"]),
+                import_date=to_date(row["declaration_date"]),
+                material_code=material_code,
+                hs_code=clean_text(row["hs_code"]),
+                name=clean_text(row["name"]),
+                origin=clean_text(row["origin"]),
+                unit_price_usd=parse_numeric(row["unit_price_usd"]),
+                exchange_rate=parse_numeric(row["exchange_rate"]),
+                remaining_qty=remaining_qty,
+                admissibility_status=admissibility_status,
+                admissible_variant_ids=admissible_variant_ids,
+            )
+            stock_by_code[material_code].append(bucket)
+
+    for buckets in stock_by_code.values():
+        buckets.sort(
+            key=lambda item: (
+                item.import_date or date.max,
+                item.declaration_no,
+                item.declaration_item_no,
+                item.bucket_id,
+            )
         )
-        stock_by_code[bucket.material_code].append(bucket)
     return stock_by_code
 
 
 def related_variants_for_model(model_code: str, variants_by_model: dict[str, list[BomVariant]]) -> list[BomVariant]:
     variants: list[BomVariant] = []
     for key, items in variants_by_model.items():
-        if key == model_code or key.startswith(f"{model_code}-"):
+        if key == model_code:
             variants.extend(items)
     return variants
 
 
-def is_bucket_eligible_for_export(bucket: StockBucket, export_line: ExportLine) -> bool:
+def bucket_is_admissible_for_variant(bucket: StockBucket, variant_id: str) -> bool:
+    if bucket.admissibility_status == "confirmed_for_variant":
+        return True
+    return variant_id in bucket.admissible_variant_ids
+
+
+def is_bucket_eligible_for_export(
+    bucket: StockBucket,
+    export_line: ExportLine,
+    import_lead_days: int,
+    max_import_age_days: int,
+) -> bool:
     if bucket.import_date is None:
         return False
-    return bucket.import_date <= export_line.export_date - timedelta(days=IMPORT_LEAD_DAYS)
+    latest_allowed_date = export_line.export_date - timedelta(days=import_lead_days)
+    if bucket.import_date > latest_allowed_date:
+        return False
+    if max_import_age_days > 0:
+        earliest_allowed_date = export_line.export_date - timedelta(days=max_import_age_days)
+        if bucket.import_date < earliest_allowed_date:
+            return False
+    return True
 
 
 def scenario_sort_key(result: ShipmentScenarioResult) -> tuple[float, float, float, float]:
@@ -382,7 +402,6 @@ def scenario_sort_key(result: ShipmentScenarioResult) -> tuple[float, float, flo
 
 def compute_material_unit_price(
     allocations: list[tuple[StockBucket, float]],
-    need_qty: float,
     valuation_mode: str,
 ) -> float | None:
     if not allocations:
@@ -401,6 +420,8 @@ def evaluate_scenario(
     scenario_variants: dict[str, BomVariant],
     stock_snapshot: dict[str, list[StockBucket]],
     valuation_mode: str,
+    import_lead_days: int,
+    max_import_age_days: int,
 ) -> ShipmentScenarioResult:
     stock_state = {code: deepcopy(buckets) for code, buckets in stock_snapshot.items()}
     product_results: list[ProductScenarioResult] = []
@@ -424,7 +445,14 @@ def evaluate_scenario(
                     break
                 if bucket.remaining_qty <= 1e-9:
                     continue
-                if not is_bucket_eligible_for_export(bucket, export_line):
+                if not bucket_is_admissible_for_variant(bucket, variant.variant_id):
+                    continue
+                if not is_bucket_eligible_for_export(
+                    bucket,
+                    export_line,
+                    import_lead_days=import_lead_days,
+                    max_import_age_days=max_import_age_days,
+                ):
                     blocked_by_date_qty += bucket.remaining_qty
                     continue
                 take_qty = min(bucket.remaining_qty, remaining_need)
@@ -442,7 +470,7 @@ def evaluate_scenario(
             if len(allocations) > 1:
                 multi_source_material_count += 1
 
-            unit_price_usd = compute_material_unit_price(allocations, need_qty, valuation_mode)
+            unit_price_usd = compute_material_unit_price(allocations, valuation_mode)
             source_origins = sorted({bucket.origin for bucket, _ in allocations if bucket.origin})
             source_declarations = sorted({bucket.declaration_no for bucket, _ in allocations})
             all_vn = bool(allocations) and all(is_vietnam_origin(bucket.origin) for bucket, _ in allocations)
@@ -460,6 +488,7 @@ def evaluate_scenario(
                     unit_price_usd=bucket.unit_price_usd,
                     exchange_rate=bucket.exchange_rate,
                     origin=bucket.origin,
+                    admissibility_status=bucket.admissibility_status,
                 )
                 for bucket, qty in allocations
             ]
@@ -526,6 +555,8 @@ def enumerate_shipment_scenarios(
     variants_by_model: dict[str, list[BomVariant]],
     stock_snapshot: dict[str, list[StockBucket]],
     valuation_mode: str,
+    import_lead_days: int,
+    max_import_age_days: int,
 ) -> tuple[list[ShipmentScenarioResult], dict[str, list[BomVariant]]]:
     variant_options: dict[str, list[BomVariant]] = {}
     for export_line in export_lines:
@@ -548,6 +579,8 @@ def enumerate_shipment_scenarios(
                 scenario_variants=scenario_variants,
                 stock_snapshot=stock_snapshot,
                 valuation_mode=valuation_mode,
+                import_lead_days=import_lead_days,
+                max_import_age_days=max_import_age_days,
             )
         )
 
@@ -611,36 +644,15 @@ def serialize_export_rows(export_rows: dict[str, list[ExportLine]]) -> dict[str,
 
 
 def serialize_stock_snapshot(stock_snapshot: dict[str, list[StockBucket]]) -> dict[str, object]:
-    return {
-        material_code: [asdict(bucket) for bucket in buckets]
-        for material_code, buckets in stock_snapshot.items()
-    }
-
-
-def write_case_workspace(
-    case_dir: Path,
-    export_rows: dict[str, list[ExportLine]],
-    variants_by_model: dict[str, list[BomVariant]],
-    stock_snapshot: dict[str, list[StockBucket]],
-    scenario_results: dict[str, list[ShipmentScenarioResult]],
-) -> None:
-    normalized_dir = case_dir / "normalized"
-    results_dir = case_dir / "results"
-    normalized_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    (normalized_dir / "export-lines.json").write_text(
-        json.dumps(serialize_export_rows(export_rows), indent=2, ensure_ascii=False, default=str)
-    )
-    (normalized_dir / "bom-variants.json").write_text(
-        json.dumps(serialize_variants(variants_by_model), indent=2, ensure_ascii=False, default=str)
-    )
-    (normalized_dir / "stock-snapshot.json").write_text(
-        json.dumps(serialize_stock_snapshot(stock_snapshot), indent=2, ensure_ascii=False, default=str)
-    )
-    (results_dir / "baseline-scenarios.json").write_text(
-        json.dumps(serialize_results(scenario_results), indent=2, ensure_ascii=False, default=str)
-    )
+    payload: dict[str, object] = {}
+    for material_code, buckets in stock_snapshot.items():
+        rows: list[dict[str, object]] = []
+        for bucket in buckets:
+            item = asdict(bucket)
+            item["admissible_variant_ids"] = sorted(bucket.admissible_variant_ids)
+            rows.append(item)
+        payload[material_code] = rows
+    return payload
 
 
 def serialize_results(results: dict[str, list[ShipmentScenarioResult]]) -> dict[str, object]:
@@ -668,10 +680,34 @@ def serialize_results(results: dict[str, list[ShipmentScenarioResult]]) -> dict[
     }
 
 
+def write_case_workspace(
+    shipment_dir: Path,
+    export_rows: dict[str, list[ExportLine]],
+    variants_by_model: dict[str, list[BomVariant]],
+    stock_snapshot: dict[str, list[StockBucket]],
+    scenario_results: dict[str, list[ShipmentScenarioResult]],
+) -> None:
+    normalized_dir = shipment_dir / "normalized"
+    results_dir = shipment_dir / "results"
+    normalized_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    (normalized_dir / "export-lines.json").write_text(
+        json.dumps(serialize_export_rows(export_rows), indent=2, ensure_ascii=False, default=str)
+    )
+    (normalized_dir / "bom-variants.json").write_text(
+        json.dumps(serialize_variants(variants_by_model), indent=2, ensure_ascii=False, default=str)
+    )
+    (normalized_dir / "stock-snapshot.json").write_text(
+        json.dumps(serialize_stock_snapshot(stock_snapshot), indent=2, ensure_ascii=False, default=str)
+    )
+    (results_dir / "baseline-scenarios.json").write_text(
+        json.dumps(serialize_results(scenario_results), indent=2, ensure_ascii=False, default=str)
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--workbook", type=Path, default=DEFAULT_WORKBOOK)
-    parser.add_argument("--xk-report", type=Path, default=DEFAULT_XK_REPORT)
     parser.add_argument(
         "--shipments",
         nargs="+",
@@ -683,6 +719,8 @@ def parse_args() -> argparse.Namespace:
         choices=("workbook_avg", "weighted"),
         default="workbook_avg",
     )
+    parser.add_argument("--import-lead-days", type=int, default=IMPORT_LEAD_DAYS)
+    parser.add_argument("--max-import-age-days", type=int, default=MAX_IMPORT_AGE_DAYS)
     parser.add_argument("--top", type=int, default=5)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--case-dir", type=Path, default=DEFAULT_CASE_DIR)
@@ -692,20 +730,25 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     shipment_ids = set(args.shipments)
-    _, variants_by_model = load_dm_variants(args.workbook)
-    export_rows = load_export_rows(args.xk_report, shipment_ids)
-    stock_snapshot = load_nk2_stock(args.workbook)
+    shared_normalized_dir = args.case_dir / "shared" / "normalized"
+    _, variants_by_model = load_dm_variants(shared_normalized_dir)
+    export_rows = load_export_rows(shared_normalized_dir, shipment_ids)
 
     all_results: dict[str, list[ShipmentScenarioResult]] = {}
     for shipment_id in args.shipments:
         if shipment_id not in export_rows:
-            raise SystemExit(f"Shipment not found in XK report: {shipment_id}")
+            raise SystemExit(f"Shipment not found in normalized exports: {shipment_id}")
+
+        candidate_admissibility = load_candidate_admissibility(args.case_dir, shipment_id)
+        stock_snapshot = load_stock_snapshot(shared_normalized_dir, candidate_admissibility)
         scenario_results, variant_options = enumerate_shipment_scenarios(
             shipment_id=shipment_id,
             export_lines=export_rows[shipment_id],
             variants_by_model=variants_by_model,
             stock_snapshot=stock_snapshot,
             valuation_mode=args.valuation_mode,
+            import_lead_days=args.import_lead_days,
+            max_import_age_days=args.max_import_age_days,
         )
         all_results[shipment_id] = scenario_results
         print_shipment_summary(
@@ -716,19 +759,18 @@ def main() -> None:
             top_n=args.top,
         )
 
+        write_case_workspace(
+            shipment_dir=args.case_dir / shipment_slug(shipment_id),
+            export_rows={shipment_id: export_rows[shipment_id]},
+            variants_by_model=variant_options,
+            stock_snapshot=stock_snapshot,
+            scenario_results={shipment_id: scenario_results},
+        )
+        print(f"Wrote case workspace {args.case_dir / shipment_slug(shipment_id)}")
+
     if args.json_out:
         args.json_out.write_text(json.dumps(serialize_results(all_results), indent=2, ensure_ascii=False, default=str))
         print(f"\nWrote {args.json_out}")
-
-    if args.case_dir:
-        write_case_workspace(
-            case_dir=args.case_dir,
-            export_rows=export_rows,
-            variants_by_model=variants_by_model,
-            stock_snapshot=stock_snapshot,
-            scenario_results=all_results,
-        )
-        print(f"Wrote case workspace {args.case_dir}")
 
 
 if __name__ == "__main__":
