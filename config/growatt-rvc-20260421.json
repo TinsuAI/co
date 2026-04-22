@@ -1,0 +1,25 @@
+{
+  "active_policy_version": "2026-04-22-no-max-age",
+  "policy_versions": {
+    "2026-04-22-default": {
+      "description": "Default Growatt shipment admissibility policy as of 2026-04-22.",
+      "import_lead_days": 2,
+      "max_import_age_days": 365,
+      "valuation_mode": "workbook_avg"
+    },
+    "2026-04-22-no-max-age": {
+      "description": "Growatt policy confirmed by staff: no one-year cap, only import lead time before export.",
+      "import_lead_days": 2,
+      "max_import_age_days": 0,
+      "valuation_mode": "workbook_avg"
+    }
+  },
+  "shipments": {
+    "GIN01426B282": {
+      "policy_version": "2026-04-22-no-max-age"
+    },
+    "GIN01426C171": {
+      "policy_version": "2026-04-22-no-max-age"
+    }
+  }
+}

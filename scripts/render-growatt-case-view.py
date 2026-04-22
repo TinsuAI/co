@@ -34,11 +34,16 @@ def main() -> None:
     args = parse_args()
     results_dir = args.case_dir / "results"
     baseline_path = results_dir / "baseline-scenarios.json"
+    run_config_path = results_dir / "run-config.json"
     if not baseline_path.exists():
         raise SystemExit(f"Missing {baseline_path}")
 
     with baseline_path.open(encoding="utf-8") as handle:
         payload = json.load(handle)
+    run_config = {}
+    if run_config_path.exists():
+        with run_config_path.open(encoding="utf-8") as handle:
+            run_config = json.load(handle)
 
     shipment_id = next(iter(payload))
     scenarios = payload[shipment_id]
@@ -188,6 +193,14 @@ def main() -> None:
     lines: list[str] = []
     lines.append(f"# Shipment {shipment_id} Baseline View")
     lines.append("")
+    if run_config:
+        lines.append("## Run Config")
+        lines.append("")
+        lines.append(f"- Policy version: `{run_config.get('policy_version', 'n/a')}`")
+        lines.append(f"- Valuation mode: `{run_config.get('valuation_mode', 'n/a')}`")
+        lines.append(f"- Import lead days: `{run_config.get('import_lead_days', 'n/a')}`")
+        lines.append(f"- Max import age days: `{run_config.get('max_import_age_days', 'n/a')}`")
+        lines.append("")
     lines.append("## Top Scenarios")
     lines.append("")
     lines.append("| Rank | Stock | RVC | Min Margin | Unmet Qty | Scenario |")

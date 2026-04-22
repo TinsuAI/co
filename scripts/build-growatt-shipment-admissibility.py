@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from growatt_case_config import resolve_shipment_policy
 
-IMPORT_LEAD_DAYS = 2
-MAX_IMPORT_AGE_DAYS = 365
+
 DEFAULT_CASE_DIR = Path("data/cases/growatt-rvc-20260421")
 DEFAULT_SHIPMENT = "GIN01426B282"
 
@@ -39,9 +40,11 @@ class VariantLine:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case-dir", type=Path, default=DEFAULT_CASE_DIR)
+    parser.add_argument("--config-path", type=Path)
     parser.add_argument("--shipment", default=DEFAULT_SHIPMENT)
-    parser.add_argument("--import-lead-days", type=int, default=IMPORT_LEAD_DAYS)
-    parser.add_argument("--max-import-age-days", type=int, default=MAX_IMPORT_AGE_DAYS)
+    parser.add_argument("--policy-version")
+    parser.add_argument("--import-lead-days", type=int)
+    parser.add_argument("--max-import-age-days", type=int)
     return parser.parse_args()
 
 
@@ -106,6 +109,10 @@ def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) 
         writer.writerows([{field: row.get(field) for field in fieldnames} for row in rows])
 
 
+def write_json(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def load_exports(exports_path: Path, shipment_id: str) -> list[ExportLine]:
     rows: list[ExportLine] = []
     with exports_path.open(encoding="utf-8") as handle:
@@ -164,6 +171,14 @@ def load_variant_lines(dm_path: Path, export_models: set[str]) -> tuple[dict[str
 
 def main() -> None:
     args = parse_args()
+    policy = resolve_shipment_policy(
+        args.case_dir,
+        args.shipment,
+        config_path_override=args.config_path,
+        policy_version_override=args.policy_version,
+        import_lead_days_override=args.import_lead_days,
+        max_import_age_days_override=args.max_import_age_days,
+    )
     shared_dir = args.case_dir / "shared" / "normalized"
     shipment_dir = args.case_dir / shipment_slug(args.shipment)
     normalized_dir = shipment_dir / "normalized"
@@ -223,8 +238,8 @@ def main() -> None:
                 eligible_by_date = is_import_eligible(
                     import_date=import_date,
                     export_date=export_line.export_date,
-                    import_lead_days=args.import_lead_days,
-                    max_import_age_days=args.max_import_age_days,
+                    import_lead_days=policy.import_lead_days,
+                    max_import_age_days=policy.max_import_age_days,
                 )
                 admissibility_rows.append(
                     {
@@ -412,8 +427,21 @@ def main() -> None:
             "ambiguity_reason",
         ],
     )
+    write_json(
+        normalized_dir / f"{slug}-run-config.json",
+        {
+            "stage": "shipment-admissibility",
+            **policy.to_dict(),
+        },
+    )
 
     print(f"Wrote admissibility artifacts to {normalized_dir}")
+    print(
+        "Policy:"
+        f" {policy.policy_version}"
+        f" | import_lead_days={policy.import_lead_days}"
+        f" | max_import_age_days={policy.max_import_age_days}"
+    )
     print(f"Variants: {len(variant_lines)}")
     print(f"Admissibility rows: {len(admissibility_rows)}")
     print(f"Ambiguity rows: {len(ambiguity_rows)}")

@@ -13,13 +13,13 @@ from datetime import date, datetime, timedelta
 from itertools import product
 from pathlib import Path
 
+from growatt_case_config import resolve_shipment_policy
+
 
 DEFAULT_CASE_DIR = Path("data/cases/growatt-rvc-20260421")
 DEFAULT_SHIPMENTS = ("GIN01426B282",)
 TARGET_RVC = 35.0
 VN_ORIGINS = {"VIETNAM", "VIỆT NAM", "VN"}
-IMPORT_LEAD_DAYS = 2
-MAX_IMPORT_AGE_DAYS = 365
 
 
 @dataclass
@@ -686,6 +686,7 @@ def write_case_workspace(
     variants_by_model: dict[str, list[BomVariant]],
     stock_snapshot: dict[str, list[StockBucket]],
     scenario_results: dict[str, list[ShipmentScenarioResult]],
+    run_config: dict[str, object],
 ) -> None:
     normalized_dir = shipment_dir / "normalized"
     results_dir = shipment_dir / "results"
@@ -704,6 +705,10 @@ def write_case_workspace(
     (results_dir / "baseline-scenarios.json").write_text(
         json.dumps(serialize_results(scenario_results), indent=2, ensure_ascii=False, default=str)
     )
+    (results_dir / "run-config.json").write_text(
+        json.dumps(run_config, indent=2, ensure_ascii=False, default=str) + "\n",
+        encoding="utf-8",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -714,13 +719,14 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_SHIPMENTS),
         help="Shipment invoice ids such as GIN01426B282",
     )
+    parser.add_argument("--config-path", type=Path)
     parser.add_argument(
         "--valuation-mode",
         choices=("workbook_avg", "weighted"),
-        default="workbook_avg",
     )
-    parser.add_argument("--import-lead-days", type=int, default=IMPORT_LEAD_DAYS)
-    parser.add_argument("--max-import-age-days", type=int, default=MAX_IMPORT_AGE_DAYS)
+    parser.add_argument("--policy-version")
+    parser.add_argument("--import-lead-days", type=int)
+    parser.add_argument("--max-import-age-days", type=int)
     parser.add_argument("--top", type=int, default=5)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--case-dir", type=Path, default=DEFAULT_CASE_DIR)
@@ -739,6 +745,15 @@ def main() -> None:
         if shipment_id not in export_rows:
             raise SystemExit(f"Shipment not found in normalized exports: {shipment_id}")
 
+        policy = resolve_shipment_policy(
+            args.case_dir,
+            shipment_id,
+            config_path_override=args.config_path,
+            policy_version_override=args.policy_version,
+            import_lead_days_override=args.import_lead_days,
+            max_import_age_days_override=args.max_import_age_days,
+            valuation_mode_override=args.valuation_mode,
+        )
         candidate_admissibility = load_candidate_admissibility(args.case_dir, shipment_id)
         stock_snapshot = load_stock_snapshot(shared_normalized_dir, candidate_admissibility)
         scenario_results, variant_options = enumerate_shipment_scenarios(
@@ -746,9 +761,9 @@ def main() -> None:
             export_lines=export_rows[shipment_id],
             variants_by_model=variants_by_model,
             stock_snapshot=stock_snapshot,
-            valuation_mode=args.valuation_mode,
-            import_lead_days=args.import_lead_days,
-            max_import_age_days=args.max_import_age_days,
+            valuation_mode=policy.valuation_mode,
+            import_lead_days=policy.import_lead_days,
+            max_import_age_days=policy.max_import_age_days,
         )
         all_results[shipment_id] = scenario_results
         print_shipment_summary(
@@ -765,8 +780,18 @@ def main() -> None:
             variants_by_model=variant_options,
             stock_snapshot=stock_snapshot,
             scenario_results={shipment_id: scenario_results},
+            run_config={
+                "stage": "baseline",
+                **policy.to_dict(),
+            },
         )
-        print(f"Wrote case workspace {args.case_dir / shipment_slug(shipment_id)}")
+        print(
+            f"Wrote case workspace {args.case_dir / shipment_slug(shipment_id)}"
+            f" | policy={policy.policy_version}"
+            f" | valuation_mode={policy.valuation_mode}"
+            f" | import_lead_days={policy.import_lead_days}"
+            f" | max_import_age_days={policy.max_import_age_days}"
+        )
 
     if args.json_out:
         args.json_out.write_text(json.dumps(serialize_results(all_results), indent=2, ensure_ascii=False, default=str))
