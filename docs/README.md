@@ -7,6 +7,7 @@ Shared project documentation for business logic, data analysis, and regulatory c
 - [CO Input/Output Model](./co-input-output-model.md)
 - [Origin Rules Specification](./origin-rules-specification.md)
 - [Origin Qualification Case Studies](./origin-qualification-case-studies.md)
+- [Growatt DM Workbook Behavior](./growatt-dm-workbook-behavior.md)
 - [Growatt RVC Case Execution Plan](./growatt-rvc-case-execution-plan.md)
 - [Growatt Valuation And Stock Insights](./growatt-valuation-and-stock-insights.md)
 - [Growatt B282 Shortage Report](./growatt-b282-shortage-report.md)
