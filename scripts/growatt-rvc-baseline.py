@@ -29,6 +29,8 @@ class ExportLine:
     declaration_item_no: int
     export_row_no: int
     export_date: date
+    invoice_no: str
+    invoice_date: date | None
     internal_code: str
     model_code: str
     hs_code: str
@@ -153,6 +155,15 @@ class ShipmentScenarioResult:
         return sum(item.unmet_qty_total for item in self.product_results)
 
 
+@dataclass(frozen=True)
+class StartingPointScenario:
+    starting_point_id: str
+    variant_strategy: str
+    sequence_strategy: str
+    export_order: list[str]
+    result: ShipmentScenarioResult
+
+
 def clean_text(value: object) -> str:
     if value is None:
         return ""
@@ -262,6 +273,8 @@ def load_export_rows(normalized_dir: Path, shipment_ids: set[str]) -> dict[str, 
                     declaration_item_no=parse_int(row["declaration_item_no"]),
                     export_row_no=row_idx,
                     export_date=export_date,
+                    invoice_no=clean_text(row["invoice_no"]),
+                    invoice_date=to_date(row["invoice_date"]),
                     internal_code=clean_text(row["declared_code"]),
                     model_code=model_code,
                     hs_code=clean_text(row["hs_code"]),
@@ -397,6 +410,35 @@ def scenario_sort_key(result: ShipmentScenarioResult) -> tuple[float, float, flo
         0.0 if result.passes_rvc else 1.0,
         -min_margin,
         result.total_unmet_qty,
+    )
+
+
+def export_line_sort_key(line: ExportLine, sequence_strategy: str) -> tuple[object, ...]:
+    if sequence_strategy == "invoice_then_declaration":
+        return (
+            line.invoice_date or line.export_date,
+            line.invoice_no,
+            line.declaration_no,
+            line.declaration_item_no,
+            line.export_row_no,
+        )
+    return (
+        line.declaration_no,
+        line.declaration_item_no,
+        line.export_row_no,
+    )
+
+
+def pick_latest_variant(options: list[BomVariant]) -> BomVariant:
+    return max(
+        options,
+        key=lambda item: (
+            item.end_row,
+            item.start_row,
+            item.block_index,
+            item.bom_code,
+            item.variant_id,
+        ),
     )
 
 
@@ -680,12 +722,108 @@ def serialize_results(results: dict[str, list[ShipmentScenarioResult]]) -> dict[
     }
 
 
+def serialize_scenario(result: ShipmentScenarioResult) -> dict[str, object]:
+    return {
+        "shipment_id": result.shipment_id,
+        "scenario_id": result.scenario_id,
+        "valuation_mode": result.valuation_mode,
+        "stock_sufficient": result.stock_sufficient,
+        "passes_rvc": result.passes_rvc,
+        "min_margin": result.min_margin,
+        "total_unmet_qty": result.total_unmet_qty,
+        "product_results": [
+            {
+                **{k: v for k, v in asdict(product_result).items() if k != "materials"},
+                "materials": [asdict(material) for material in product_result.materials],
+            }
+            for product_result in result.product_results
+        ],
+    }
+
+
+def build_starting_points(
+    shipment_id: str,
+    export_lines: list[ExportLine],
+    variants_by_model: dict[str, list[BomVariant]],
+    scenario_results: list[ShipmentScenarioResult],
+    stock_snapshot: dict[str, list[StockBucket]],
+    valuation_mode: str,
+    import_lead_days: int,
+    max_import_age_days: int,
+) -> dict[str, StartingPointScenario]:
+    if not scenario_results:
+        raise SystemExit(f"No baseline scenarios available for {shipment_id}")
+
+    heuristic_best = StartingPointScenario(
+        starting_point_id="heuristic_best",
+        variant_strategy="global_best_after_exhaustive_sort",
+        sequence_strategy="declaration_order",
+        export_order=[
+            f"{line.model_code}:{line.declaration_no}:{line.declaration_item_no}"
+            for line in export_lines
+        ],
+        result=scenario_results[0],
+    )
+
+    staff_export_lines = sorted(
+        export_lines,
+        key=lambda line: export_line_sort_key(line, "invoice_then_declaration"),
+    )
+    staff_variants = {
+        model_code: pick_latest_variant(options)
+        for model_code, options in variants_by_model.items()
+    }
+    staff_result = evaluate_scenario(
+        shipment_id=shipment_id,
+        export_lines=staff_export_lines,
+        scenario_variants=staff_variants,
+        stock_snapshot=stock_snapshot,
+        valuation_mode=valuation_mode,
+        import_lead_days=import_lead_days,
+        max_import_age_days=max_import_age_days,
+    )
+    staff_seed = StartingPointScenario(
+        starting_point_id="staff_latest_bom_invoice_order",
+        variant_strategy="latest_dm_block_per_model",
+        sequence_strategy="invoice_then_declaration",
+        export_order=[
+            f"{line.model_code}:{line.invoice_no or 'no-invoice'}:{line.declaration_no}:{line.declaration_item_no}"
+            for line in staff_export_lines
+        ],
+        result=staff_result,
+    )
+
+    return {
+        heuristic_best.starting_point_id: heuristic_best,
+        staff_seed.starting_point_id: staff_seed,
+    }
+
+
+def serialize_starting_points(
+    payload: dict[str, dict[str, StartingPointScenario]],
+) -> dict[str, object]:
+    return {
+        shipment_id: {
+            starting_point_id: {
+                "starting_point_id": item.starting_point_id,
+                "variant_strategy": item.variant_strategy,
+                "sequence_strategy": item.sequence_strategy,
+                "export_order": item.export_order,
+                "scenario": serialize_scenario(item.result),
+            }
+            for starting_point_id, item in starting_points.items()
+        }
+        for shipment_id, starting_points in payload.items()
+    }
+
+
 def write_case_workspace(
     shipment_dir: Path,
     export_rows: dict[str, list[ExportLine]],
     variants_by_model: dict[str, list[BomVariant]],
     stock_snapshot: dict[str, list[StockBucket]],
     scenario_results: dict[str, list[ShipmentScenarioResult]],
+    starting_points: dict[str, dict[str, StartingPointScenario]],
     run_config: dict[str, object],
 ) -> None:
     normalized_dir = shipment_dir / "normalized"
@@ -704,6 +842,9 @@ def write_case_workspace(
     )
     (results_dir / "baseline-scenarios.json").write_text(
         json.dumps(serialize_results(scenario_results), indent=2, ensure_ascii=False, default=str)
+    )
+    (results_dir / "baseline-starting-points.json").write_text(
+        json.dumps(serialize_starting_points(starting_points), indent=2, ensure_ascii=False, default=str)
     )
     (results_dir / "run-config.json").write_text(
         json.dumps(run_config, indent=2, ensure_ascii=False, default=str) + "\n",
@@ -741,6 +882,7 @@ def main() -> None:
     export_rows = load_export_rows(shared_normalized_dir, shipment_ids)
 
     all_results: dict[str, list[ShipmentScenarioResult]] = {}
+    all_starting_points: dict[str, dict[str, StartingPointScenario]] = {}
     for shipment_id in args.shipments:
         if shipment_id not in export_rows:
             raise SystemExit(f"Shipment not found in normalized exports: {shipment_id}")
@@ -766,6 +908,17 @@ def main() -> None:
             max_import_age_days=policy.max_import_age_days,
         )
         all_results[shipment_id] = scenario_results
+        starting_points = build_starting_points(
+            shipment_id=shipment_id,
+            export_lines=export_rows[shipment_id],
+            variants_by_model=variant_options,
+            scenario_results=scenario_results,
+            stock_snapshot=stock_snapshot,
+            valuation_mode=policy.valuation_mode,
+            import_lead_days=policy.import_lead_days,
+            max_import_age_days=policy.max_import_age_days,
+        )
+        all_starting_points[shipment_id] = starting_points
         print_shipment_summary(
             shipment_id=shipment_id,
             export_lines=export_rows[shipment_id],
@@ -780,9 +933,20 @@ def main() -> None:
             variants_by_model=variant_options,
             stock_snapshot=stock_snapshot,
             scenario_results={shipment_id: scenario_results},
+            starting_points={shipment_id: starting_points},
             run_config={
                 "stage": "baseline",
                 **policy.to_dict(),
+                "starting_points": {
+                    "heuristic_best": {
+                        "variant_strategy": "global_best_after_exhaustive_sort",
+                        "sequence_strategy": "declaration_order",
+                    },
+                    "staff_latest_bom_invoice_order": {
+                        "variant_strategy": "latest_dm_block_per_model",
+                        "sequence_strategy": "invoice_then_declaration",
+                    },
+                },
             },
         )
         print(

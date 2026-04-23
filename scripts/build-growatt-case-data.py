@@ -55,6 +55,33 @@ def clean_text(value: object) -> str:
     return str(value).strip()
 
 
+def normalize_code_text(value: object, field_name: str) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, int):
+        raise ValueError(f"{field_name} must be stored as text, got integer {value!r}")
+    if isinstance(value, float):
+        raise ValueError(f"{field_name} must be stored as text, got numeric {value!r}")
+    return str(value).strip()
+
+
+def normalize_integral_identifier(value: object, field_name: str) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        raise ValueError(f"{field_name} must be an integer-like identifier, got {value!r}")
+    text = clean_text(value)
+    if re.fullmatch(r"\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text
+
+
 def parse_float(value: object) -> float:
     text = clean_text(value)
     if not text:
@@ -304,6 +331,8 @@ def load_shared_strings(archive: ZipFile) -> list[str]:
 
 
 def cell_value(cell: ET.Element, shared_strings: list[str]) -> str | None:
+    if cell.attrib.get("t") == "inlineStr":
+        return "".join(text.text or "" for text in cell.iter(f"{NS}t"))
     raw = cell.find(f"{NS}v")
     if raw is None:
         return None
@@ -329,10 +358,12 @@ def load_dm_variants(workbook_path: Path) -> list[dict[str, object]]:
             for cell in elem.findall(f"{NS}c"):
                 ref = cell.attrib["r"]
                 col = "".join(ch for ch in ref if ch.isalpha())
+                if col in {"A", "F"} and cell.attrib.get("t") not in {"s", "str", "inlineStr"}:
+                    raise ValueError(f"DM code cell {ref} must be stored as text")
                 values[col] = cell_value(cell, shared_strings)
-            bom_code = clean_text(values.get("A"))
+            bom_code = normalize_code_text(values.get("A"), f"DM bom_code row {row_no}")
             ordinal_key = clean_text(values.get("B"))
-            material_code = clean_text(values.get("F"))
+            material_code = normalize_code_text(values.get("F"), f"DM material_code row {row_no}")
             qty_raw = values.get("I")
             if bom_code and material_code and qty_raw not in (None, ""):
                 rows.append((row_no, bom_code, ordinal_key, material_code, float(qty_raw)))
@@ -384,14 +415,16 @@ def load_xk_rows(report_path: Path) -> list[dict[str, object]]:
         name = clean_text(row[22])
         if not name:
             continue
-        declared_code = clean_text(row[20])
+        declared_code = normalize_code_text(row[20], f"XK declared_code row {row_idx + 1}")
         name_fields = derive_name_fields(name, declared_code)
+        declaration_no = normalize_integral_identifier(row[1], f"XK declaration_no row {row_idx + 1}")
+        declaration_item_no = normalize_integral_identifier(row[19], f"XK declaration_item_no row {row_idx + 1}")
         rows.append(
             {
                 "source_row_no": row_idx + 1,
-                "declaration_no": str(int(row[1])),
+                "declaration_no": declaration_no,
                 "declaration_date": to_date(row[2], book.datemode),
-                "declaration_item_no": int(row[19]),
+                "declaration_item_no": declaration_item_no,
                 "shipment_id": clean_text(row[50]),
                 "declared_code": declared_code,
                 "hs_code": clean_text(row[21]),
@@ -417,20 +450,22 @@ def load_bcct_nk_rows(report_path: Path, usd_customs_rates: list[tuple[date, flo
     for row_idx in range(10, sheet.nrows):
         row = sheet.row_values(row_idx)
         name = clean_text(row[22])
-        declared_code = clean_text(row[20])
+        declared_code = normalize_code_text(row[20], f"NK report declared_code row {row_idx + 1}")
         if not declared_code and not name:
             continue
         name_fields = derive_name_fields(name, declared_code)
         declaration_date = to_date(row[2], book.datemode)
         price_fields = normalize_price_fields(row[24], row[25], row[10], declaration_date, usd_customs_rates)
+        declaration_no = normalize_integral_identifier(row[1], f"NK report declaration_no row {row_idx + 1}")
+        declaration_item_no = normalize_integral_identifier(row[19], f"NK report declaration_item_no row {row_idx + 1}")
         rows.append(
             {
                 "source": "BCCT_NK",
                 "source_row_no": row_idx + 1,
-                "declaration_no": str(int(row[1])),
+                "declaration_no": declaration_no,
                 "declaration_date": declaration_date,
-                "declaration_item_no": int(row[19]),
-                "tracking_key": make_line_key(int(row[1]), int(row[19])),
+                "declaration_item_no": declaration_item_no,
+                "tracking_key": make_line_key(declaration_no, declaration_item_no),
                 "declared_code": declared_code,
                 "lookup_material_code": name_fields["candidate_lookup_code"],
                 "hs_code": clean_text(row[21]),
@@ -458,21 +493,23 @@ def load_nk2_rows(workbook_path: Path, usd_customs_rates: list[tuple[date, float
     sheet = workbook["NK2"]
     rows: list[dict[str, object]] = []
     for row_no, row in enumerate(sheet.iter_rows(min_row=5, values_only=True), start=5):
-        declared_code = clean_text(row[4])
+        declared_code = normalize_code_text(row[4], f"NK2 declared_code row {row_no}")
         name = clean_text(row[6])
         if not declared_code and not name:
             continue
         name_fields = derive_name_fields(name, declared_code)
         declaration_date = to_date(row[1])
         price_fields = normalize_price_fields(row[8], row[9], row[15], declaration_date, usd_customs_rates)
+        declaration_no = normalize_integral_identifier(row[0], f"NK2 declaration_no row {row_no}")
+        declaration_item_no = normalize_integral_identifier(row[3], f"NK2 declaration_item_no row {row_no}")
         rows.append(
             {
                 "source": "NK2",
                 "source_row_no": row_no,
-                "declaration_no": str(int(row[0])),
+                "declaration_no": declaration_no,
                 "declaration_date": declaration_date,
-                "declaration_item_no": int(row[3]),
-                "tracking_key": make_line_key(int(row[0]), int(row[3])),
+                "declaration_item_no": declaration_item_no,
+                "tracking_key": make_line_key(declaration_no, declaration_item_no),
                 "declared_code": declared_code,
                 "lookup_material_code": name_fields["candidate_lookup_code"],
                 "hs_code": clean_text(row[5]),
@@ -556,9 +593,37 @@ def write_xlsx(
             ws.append(["empty"])
             return
         fieldnames = list(rows[0].keys())
+        text_fields = {
+            "tracking_key",
+            "declaration_no",
+            "declaration_item_no",
+            "declared_code",
+            "lookup_material_code",
+            "confirmed_lookup_code",
+            "final_lookup_key",
+            "matched_nk2_source_row_no",
+            "hs_code",
+            "label_code",
+            "paren_code_candidates",
+            "invoice_no",
+            "nk2_source_row_no",
+            "bcct_source_row_no",
+            "shipment_id",
+            "internal_code_for_dm",
+            "incoterm",
+            "bom_code",
+            "product_family_code",
+            "bom_variant_id",
+            "material_code",
+            "ordinal_key",
+        }
         ws.append(fieldnames)
         for row in rows:
             ws.append([row.get(field) for field in fieldnames])
+        for idx, field in enumerate(fieldnames, start=1):
+            if field in text_fields:
+                for row_idx in range(2, ws.max_row + 1):
+                    ws.cell(row=row_idx, column=idx).number_format = "@"
         ws.freeze_panes = "A2"
 
     summary = wb.create_sheet("SUMMARY")

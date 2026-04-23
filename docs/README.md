@@ -9,6 +9,7 @@ Shared project documentation for business logic, data analysis, and regulatory c
 - [Origin Qualification Case Studies](./origin-qualification-case-studies.md)
 - [Growatt RVC Case Execution Plan](./growatt-rvc-case-execution-plan.md)
 - [Growatt Valuation And Stock Insights](./growatt-valuation-and-stock-insights.md)
+- [Growatt B282 Shortage Report](./growatt-b282-shortage-report.md)
 - [Replacement Rules And Sprint Plan](./growatt-replacement-rules-and-sprints.md)
 - [Procedure And Workbook Analysis](./procedure-and-workbook-analysis.md)
 - [CO Knowledge Base](./co-knowledge-base.md)
