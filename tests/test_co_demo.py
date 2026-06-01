@@ -42,6 +42,7 @@ from app.source_index_store import (
     PostgresSourceIndexStore,
     source_state_from_workspace,
 )
+from app.material_search import fold_text, match_score, rank_matches
 from app.table_view import build_table_view
 from app.workbook_io import create_evidence_workbook, create_input_workbook, parse_input_workbook
 
@@ -347,6 +348,50 @@ def test_table_view_clamps_page_to_available_results():
     assert table["page"] == 2
     assert table["total_pages"] == 2
     assert [row["code"] for row in table["rows"]] == ["C"]
+
+
+def test_material_search_multi_token_matches_across_fields():
+    # "res blue" must hit code (RES…) AND name (…blue), in any field, any order.
+    assert match_score("res blue", ["RES-100", "Blue resistor"]) is not None
+    assert match_score("blue res", ["RES-100", "Blue resistor"]) is not None
+    # A token that matches no field excludes the row entirely.
+    assert match_score("res green", ["RES-100", "Blue resistor"]) is None
+
+
+def test_material_search_is_accent_insensitive():
+    assert match_score("dien tro", ["RES-1", "Điện trở 1k"]) is not None
+    assert fold_text("Điện trở") == "dien tro"
+
+
+def test_material_search_ranks_code_match_above_incidental_name_match():
+    rows = [
+        {"material_code": "CAP-001", "name": "Resin coated"},   # 'res' only in name
+        {"material_code": "RES-001", "name": "Standard part"},  # 'res' as code prefix
+    ]
+    ranked = rank_matches("res", rows, lambda r: [r["material_code"], r["name"]])
+    assert [r["material_code"] for r in ranked] == ["RES-001", "CAP-001"]
+
+
+def test_material_search_subsequence_tolerates_abbreviation():
+    # 'dintro' is a subsequence of code 'DIENTRO.CHIP' (missing 'e') — matches.
+    assert match_score("dintro", ["DIENTRO.CHIP", "Chip điện trở"]) is not None
+    # Unrelated token does not.
+    assert match_score("zzzq", ["DIENTRO.CHIP", "Chip điện trở"]) is None
+
+
+def test_material_search_subsequence_does_not_scatter_match_long_descriptions():
+    # 'aptomat' must NOT subsequence-match a long spaced IC description.
+    ic = ["007.0061200", "Mạch tích hợp IC, đơn vị điều khiển. Hàng mới 100%"]
+    assert match_score("aptomat", ic) is None
+
+
+def test_material_search_numeric_token_requires_real_digit_run_not_subsequence():
+    # '5000' scatter-matches HS '85044090' (5,0,0,0) as a subsequence — must be
+    # rejected; only a real "5000" substring (in code/name/HS) should match.
+    no_5000 = ["BIENTAN.05", "Thiết bị biến tần model MIN 10000TL", "85044090"]
+    assert match_score("bientan 5000", no_5000) is None
+    has_5000 = ["BIENTAN.18", "Thiết bị biến tần model MIN 5000TL-X2", "85044090"]
+    assert match_score("bientan 5000", has_5000) is not None
 
 
 def test_catalog_bom_stock_bcct_are_data_views_and_co_case_is_workflow_entry():

@@ -4635,6 +4635,18 @@ body.co-stock-history-modal-open { overflow: hidden; }
   font-size: 0.9rem;
 }
 
+.origin-substitute-filter {
+  display: grid;
+  gap: 0.2rem;
+  font-size: 0.8rem;
+  margin-bottom: 0.6rem;
+}
+
+.origin-substitute-filter input {
+  padding: 0.35rem 0.5rem;
+  font-size: 0.9rem;
+}
+
 .origin-substitute-mode {
   font-size: 0.75rem;
   color: var(--foreground-muted);

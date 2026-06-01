@@ -9,6 +9,7 @@ import httpx
 from app.client_config_store import default_config, migrate_config
 from app.co_case_store import match_case_bcct_exports
 from app.data_hub_settings import data_hub_link_settings
+from app.material_search import rank_matches
 from app.source_store import (
     _safe_customs_fx_rows,
     co_stock_rows_from_bcct,
@@ -659,20 +660,18 @@ class DataHubPortfolioService:
     def search_materials(self, client_id: str, query: str, limit: int = 20) -> list[dict]:
         if not hasattr(self.data_hub, "list_materials"):
             return []
-        rows = []
-        for row in self.data_hub.list_materials(client_id):
-            normalized = normalize_material_row(row)
-            haystack = " ".join([
-                str(normalized.get("material_code") or ""),
-                str(normalized.get("internal_code") or ""),
-                str(normalized.get("name") or ""),
-                str(normalized.get("hs_code") or ""),
-            ]).lower()
-            if not query or query.lower() in haystack:
-                rows.append(normalized)
-                if len(rows) >= max(1, min(limit, 100)):
-                    break
-        return rows
+        rows = [normalize_material_row(row) for row in self.data_hub.list_materials(client_id)]
+        return rank_matches(
+            query,
+            rows,
+            lambda row: [
+                row.get("material_code"),
+                row.get("internal_code"),
+                row.get("name"),
+                row.get("hs_code"),
+            ],
+            limit=limit,
+        )
 
     def co_case_source_context(self, client: dict, case: dict, *, skip_heavy_context: bool = False) -> dict:
         source_summary, source_backend = self.source_summary(client)

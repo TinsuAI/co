@@ -14,6 +14,7 @@ from app.client_config_store import save_client_config as persist_client_config
 from app.co_case_store import match_case_bcct_exports
 from app.data_hub_client import DataHubPortfolioService, current_data_hub_token, data_hub_client_from_env
 from app.data_hub_settings import data_hub_link_settings
+from app.material_search import rank_matches
 from app.demo_data import get_client as seed_get_client
 from app.demo_data import get_clients as seed_get_clients
 from app.source_index_store import get_source_index_store, rebuild_source_index_if_configured
@@ -200,20 +201,17 @@ class PortfolioService:
             rows = catalog.get("published_rows") or catalog.get("rows") or []
         else:
             rows = []
-        text_query = (query or "").lower().strip()
-        matches: list[dict] = []
-        for row in rows:
-            haystack = " ".join([
-                str(row.get("material_code") or ""),
-                str(row.get("internal_code") or ""),
-                str(row.get("name") or ""),
-                str(row.get("hs_code") or ""),
-            ]).lower()
-            if not text_query or text_query in haystack:
-                matches.append(row)
-                if len(matches) >= max(1, min(limit, 100)):
-                    break
-        return matches
+        return rank_matches(
+            query,
+            rows,
+            lambda row: [
+                row.get("material_code"),
+                row.get("internal_code"),
+                row.get("name"),
+                row.get("hs_code"),
+            ],
+            limit=limit,
+        )
 
     def material_catalog_template(self, client: dict) -> bytes:
         return create_material_catalog_template_workbook(client)

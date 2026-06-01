@@ -92,6 +92,7 @@ from app.demo_data import (
     update_products_from_form,
 )
 from app.origin import evaluate_tariff_shift
+from app import material_search
 from app.app_state_store import get_app_state_store
 from app.portfolio import SourceBackendUnavailable, portfolio_app, portfolio_service
 from app.source_store import (
@@ -7092,12 +7093,12 @@ async def co_case_origin_sheet_substitute_candidates(
 
 
 def search_case_material_rows(case: dict, query: str, limit: int = 20) -> list[dict]:
-    text_query = (query or "").strip().lower()
-    if not text_query:
+    if not (query or "").strip():
         return []
-    rows: list[dict] = []
-    seen: set[str] = set()
     max_rows = max(1, min(limit, 100))
+    scored: list[tuple[float, int, dict]] = []
+    seen: set[str] = set()
+    position = 0
     for product in case.get("products", []) or []:
         for material in product.get("materials", []) or []:
             code = str(
@@ -7108,28 +7109,28 @@ def search_case_material_rows(case: dict, query: str, limit: int = 20) -> list[d
             ).strip()
             if not code or code in seen:
                 continue
-            haystack = " ".join([
+            score = material_search.match_score(query, [
                 code,
-                str(material.get("internal_code") or ""),
-                str(material.get("internal_material_code") or ""),
-                str(material.get("material_description") or ""),
-                str(material.get("name") or ""),
-                str(material.get("hs_code") or material.get("import_hs") or ""),
-            ]).lower()
-            if text_query not in haystack:
+                material.get("internal_code"),
+                material.get("internal_material_code"),
+                material.get("material_description"),
+                material.get("name"),
+                material.get("hs_code") or material.get("import_hs"),
+            ])
+            if score is None:
                 continue
             seen.add(code)
-            rows.append({
+            scored.append((score, position, {
                 "material_code": code,
                 "internal_code": material.get("internal_code") or material.get("internal_material_code") or code,
                 "name": material.get("name") or material.get("material_description") or "",
                 "material_description": material.get("material_description") or material.get("name") or "",
                 "category": material.get("category", ""),
                 "hs_code": material.get("hs_code") or material.get("import_hs") or "",
-            })
-            if len(rows) >= max_rows:
-                return rows
-    return rows
+            }))
+            position += 1
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [row for _, _, row in scored[:max_rows]]
 
 
 @app.get("/clients/{client_id}/co-case/{case_id}/origin/sheet/{product_code}/substitute-stock")

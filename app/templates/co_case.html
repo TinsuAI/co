@@ -1683,13 +1683,17 @@
     </div>
     <div class="origin-substitute-modal-body">
       <section class="origin-substitute-section" data-origin-substitute-tab-panel="recommended">
+        <label class="origin-substitute-filter">Lọc nhanh
+          <input type="search" data-origin-substitute-recommended-filter placeholder="Mã, tên, HS — lọc ngay khi gõ">
+        </label>
         <ul class="origin-substitute-list" data-origin-substitute-list="recommended"></ul>
         <p class="empty-cell" data-origin-substitute-empty="recommended" hidden>Chưa có khuyến nghị từ Data Hub.</p>
+        <p class="empty-cell" data-origin-substitute-filter-empty hidden>Không có khuyến nghị khớp bộ lọc.</p>
       </section>
       <section class="origin-substitute-section" data-origin-substitute-tab-panel="search" hidden>
         <div class="origin-substitute-search-panel">
           <label class="origin-substitute-search">Tìm NVL khác
-            <input type="search" data-origin-substitute-search placeholder="Mã, tên, hoặc HS — Enter để tìm">
+            <input type="search" data-origin-substitute-search placeholder="Gõ nhiều từ: mã + tên + HS (vd 'dientro chip') — Enter để tìm">
           </label>
           <button type="button" class="btn-primary" data-origin-substitute-search-button>Tìm</button>
         </div>
@@ -2976,7 +2980,56 @@
     const searchList = modal.querySelector('[data-origin-substitute-list="search"]');
     const recommendedEmpty = modal.querySelector('[data-origin-substitute-empty="recommended"]');
     const searchEmpty = modal.querySelector('[data-origin-substitute-empty="search"]');
+    const recommendedFilterInput = modal.querySelector("[data-origin-substitute-recommended-filter]");
+    const recommendedFilterEmpty = modal.querySelector("[data-origin-substitute-filter-empty]");
     let activeTab = "recommended";
+
+    const foldText = (value) => String(value == null ? "" : value)
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/đ/g, "d").replace(/Đ/g, "D")
+      .toLowerCase().trim();
+    const isSubsequence = (token, field) => {
+      let i = 0;
+      for (const ch of field) {
+        if (ch === token[i]) i += 1;
+        if (i >= token.length) return true;
+      }
+      return token.length === 0;
+    };
+    // Subsequence only on short space-free fields (codes/HS), and only for
+    // alphabetic tokens >=3 chars — see app/material_search._subseq_eligible /
+    // _token_allows_subseq. A numeric token like '5000' must match a real digit
+    // run, else it scatter-matches HS codes.
+    const subseqEligible = (field) => !field.includes(" ") && field.length <= 24;
+    const tokenAllowsSubseq = (tok) => tok.length >= 3 && /[a-z]/.test(tok);
+    // Mirror of app/material_search.match_score: every token must hit some
+    // field (substring, or subsequence on code-like fields), accent-insensitive.
+    const matchesTokens = (query, fields) => {
+      const tokens = foldText(query).split(/\s+/).filter(Boolean);
+      if (!tokens.length) return true;
+      const folded = fields.map(foldText);
+      return tokens.every((tok) => folded.some((f) =>
+        f.includes(tok) || (tokenAllowsSubseq(tok) && subseqEligible(f) && isSubsequence(tok, f))));
+    };
+    const applyRecommendedFilter = () => {
+      const query = recommendedFilterInput?.value || "";
+      const items = recommendedList.querySelectorAll("li.origin-substitute-item");
+      let visible = 0;
+      items.forEach((li) => {
+        const code = li.querySelector(".origin-substitute-item-code")?.textContent || "";
+        const name = li.querySelector(".origin-substitute-item-name")?.textContent || "";
+        const hs = li.querySelector(".origin-substitute-item-meta .mono")?.textContent || "";
+        const show = matchesTokens(query, [code, name, hs]);
+        li.hidden = !show;
+        if (show) visible += 1;
+      });
+      if (recommendedFilterEmpty) {
+        const hasItems = items.length > 0;
+        recommendedFilterEmpty.hidden = !(hasItems && visible === 0 && query.trim());
+      }
+    };
+    recommendedFilterInput?.addEventListener("input", applyRecommendedFilter);
 
     const activateTab = (name) => {
       activeTab = name === "search" ? "search" : "recommended";
@@ -3707,6 +3760,7 @@
         });
         recommendedEmpty.hidden = (data.candidates || []).length > 0;
         mergeLazyStock(data, data.candidates || []);
+        applyRecommendedFilter();
         if (data.candidates_source === "co_heuristic" && (data.candidates || []).length > 0) {
           // Insert a banner above the list so user knows this is fallback.
           const banner = document.createElement("li");
@@ -3819,6 +3873,8 @@
         modal.hidden = false;
         document.body.classList.add("origin-substitute-modal-open");
         if (searchInput) searchInput.value = "";
+        if (recommendedFilterInput) recommendedFilterInput.value = "";
+        if (recommendedFilterEmpty) recommendedFilterEmpty.hidden = true;
         if (searchList) searchList.innerHTML = "";
         if (searchEmpty) {
           searchEmpty.hidden = false;
@@ -3848,6 +3904,8 @@
         if (searchInput) {
           searchInput.value = "";
         }
+        if (recommendedFilterInput) recommendedFilterInput.value = "";
+        if (recommendedFilterEmpty) recommendedFilterEmpty.hidden = true;
         if (recommendedList) recommendedList.innerHTML = "";
         if (recommendedEmpty) {
           recommendedEmpty.hidden = false;
