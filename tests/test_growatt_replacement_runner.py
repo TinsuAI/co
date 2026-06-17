@@ -1218,6 +1218,135 @@ class GrowattReplacementRunnerTests(unittest.TestCase):
             ["Initial Buckets", "Consumption Ledger", "Stock After Product", "Final Buckets", "Final By Material"],
         )
 
+    def test_build_candidate_rows_technical_reference_filters_to_whitelist(self) -> None:
+        material = runner.MaterialState(
+            original_material_code="ORIG",
+            need_qty=10.0,
+            exact_allocated_qty=0.0,
+            unmet_qty=10.0,
+            custom_code_basis="FAMILY",
+        )
+        stock_by_basis = {
+            "FAMILY": [
+                make_bucket(
+                    basis="FAMILY",
+                    material="REPL-ALLOWED",
+                    bucket_id="allowed",
+                    qty=10.0,
+                    unit_price=1.0,
+                    import_date=date(2026, 4, 1),
+                ),
+                make_bucket(
+                    basis="FAMILY",
+                    material="REPL-BLOCKED",
+                    bucket_id="blocked",
+                    qty=10.0,
+                    unit_price=1.0,
+                    import_date=date(2026, 4, 1),
+                ),
+            ]
+        }
+        stock_by_material = {
+            "REPL-ALLOWED": [stock_by_basis["FAMILY"][0]],
+            "REPL-BLOCKED": [stock_by_basis["FAMILY"][1]],
+        }
+        rows = runner.build_candidate_rows(
+            self.baseline,
+            runner.CandidateContext(
+                starting_point_id="seed",
+                sequence_no=1,
+                iteration_no=1,
+                model_code=self.export_line.model_code,
+                variant_id=self.variant.variant_id,
+                declaration_no=self.export_line.declaration_no,
+            ),
+            self.export_line,
+            self.variant,
+            [material],
+            runner.summarize_product(self.baseline, self.export_line, [material]),
+            material,
+            stock_by_basis,
+            set(),
+            import_lead_days=2,
+            max_import_age_days=0,
+            stock_by_material=stock_by_material,
+            replacement_mode=runner.REPLACEMENT_MODE_TECHNICAL_REFERENCE,
+            explicit_substitute_index={("MODEL-A", "ORIG"): {"REPL-ALLOWED"}},
+        )
+        self.assertEqual([row["candidate_material_code"] for row in rows], ["REPL-ALLOWED"])
+
+    def test_technical_reference_mode_can_use_cross_basis_explicit_substitute(self) -> None:
+        initial_stock = {
+            "ORIG": [
+                make_bucket(
+                    basis="FAMILY-ORIG",
+                    material="ORIG",
+                    bucket_id="orig-expensive",
+                    qty=1.0,
+                    unit_price=80.0,
+                    import_date=date(2026, 4, 1),
+                )
+            ],
+            "ALT-VN": [
+                make_bucket(
+                    basis="FAMILY-ALT",
+                    material="ALT-VN",
+                    bucket_id="alt-vn",
+                    qty=1.0,
+                    unit_price=5.0,
+                    import_date=date(2026, 4, 1),
+                    origin="VIETNAM",
+                )
+            ],
+        }
+        basis_stats = {
+            "ORIG": {
+                "FAMILY-ORIG": runner.BasisStats(
+                    custom_code_basis="FAMILY-ORIG",
+                    distinct_material_codes={"ORIG"},
+                    total_qty=1.0,
+                    confirmed_qty=1.0,
+                )
+            }
+        }
+        variant = FakeVariant("MODEL-A__block1", "MODEL-A", [FakeBomLine("ORIG", 1.0)])
+        export_line = FakeExportLine("MODEL-A", "DECL-1", 1, date(2026, 4, 10), 1.0, 100.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            heuristic_result = runner.run_starting_point(
+                self.baseline,
+                shipment_id="SHIP",
+                starting_point_id="seed",
+                export_lines=[export_line],
+                variant_by_id={"MODEL-A": variant},
+                initial_stock_by_material=initial_stock,
+                material_basis_stats=basis_stats,
+                staff_substitutes=set(),
+                import_lead_days=2,
+                max_import_age_days=0,
+                output_dir=tmp_path / "heuristic",
+            )
+            reference_result = runner.run_starting_point(
+                self.baseline,
+                shipment_id="SHIP",
+                starting_point_id="seed",
+                export_lines=[export_line],
+                variant_by_id={"MODEL-A": variant},
+                initial_stock_by_material=initial_stock,
+                material_basis_stats=basis_stats,
+                staff_substitutes=set(),
+                import_lead_days=2,
+                max_import_age_days=0,
+                output_dir=tmp_path / "reference",
+                replacement_mode=runner.REPLACEMENT_MODE_TECHNICAL_REFERENCE,
+                explicit_substitute_index={("MODEL-A", "ORIG"): {"ALT-VN"}},
+            )
+
+        self.assertFalse(heuristic_result["seed_summary"]["product_status"][0]["passes_after"])
+        self.assertTrue(reference_result["seed_summary"]["product_status"][0]["passes_after"])
+        self.assertEqual(reference_result["seed_summary"]["product_status"][0]["changed_materials"], "ORIG")
+
 
 if __name__ == "__main__":
     unittest.main()

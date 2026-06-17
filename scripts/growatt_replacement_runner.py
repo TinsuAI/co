@@ -13,11 +13,13 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from growatt_case_config import resolve_shipment_policy
+from growatt_bom_sources import technical_priority_artifact_dir
 
 
 DEFAULT_CASE_DIR = Path("data/cases/growatt-rvc-20260421")
@@ -26,6 +28,8 @@ DEFAULT_DOC = Path("docs/growatt-b282-replacement-runner.md")
 EPS = 1e-9
 COST_EPS = 1e-4
 INTERNAL_MATERIAL_CODE_RE = re.compile(r"^[A-Z]*\d+(?:\.\d+)+(?:-[A-Z0-9-]+)?$")
+REPLACEMENT_MODE_HEURISTIC_CUSTOM_BASIS = "heuristic_custom_basis"
+REPLACEMENT_MODE_TECHNICAL_REFERENCE = "technical_reference_explicit"
 STAFF_SUBSTITUTE_PATHS = (
     Path(
         "data/extracted/Growatt-20260421/unpacked/"
@@ -171,6 +175,13 @@ REVIEW_SCOPE_RANK = {
 }
 
 
+def replacement_mode_choices() -> tuple[str, ...]:
+    return (
+        REPLACEMENT_MODE_HEURISTIC_CUSTOM_BASIS,
+        REPLACEMENT_MODE_TECHNICAL_REFERENCE,
+    )
+
+
 def clean_text(value: object) -> str:
     if value is None:
         return ""
@@ -205,6 +216,67 @@ def to_date(value: object) -> date | None:
 
 def looks_like_internal_material_code(text: str) -> bool:
     return bool(text and INTERNAL_MATERIAL_CODE_RE.match(text))
+
+
+def normalize_reference_material_code(value: object) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    if re.fullmatch(r"\d+\.\d+", text):
+        numeric = float(text)
+        formatted = f"{numeric:.7f}"
+        left, right = formatted.split(".", 1)
+        return f"{left.zfill(3)}.{right}"
+    return text
+
+
+def load_workspace_variants(normalized_dir: Path) -> dict[str, list[object]]:
+    path = normalized_dir / "bom-variants.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    variants_by_model: dict[str, list[object]] = {}
+    for model_code, items in payload.items():
+        variants: list[object] = []
+        for item in items:
+            lines = [
+                SimpleNamespace(
+                    material_code=clean_text(line["material_code"]),
+                    qty_per_unit=parse_numeric(line["qty_per_unit"]),
+                    row_no=parse_int(line.get("row_no")),
+                    ordinal_key=clean_text(line.get("ordinal_key")),
+                )
+                for line in item["lines"]
+            ]
+            variants.append(
+                SimpleNamespace(
+                    variant_id=clean_text(item["variant_id"]),
+                    model_code=clean_text(item["model_code"]),
+                    bom_code=clean_text(item["bom_code"]),
+                    block_index=parse_int(item.get("block_index")),
+                    start_row=parse_int(item.get("start_row")),
+                    end_row=parse_int(item.get("end_row")),
+                    line_count=parse_int(item.get("line_count")),
+                    lines=lines,
+                )
+            )
+        variants_by_model[model_code] = variants
+    return variants_by_model
+
+
+def load_explicit_substitute_index(path: Path) -> dict[tuple[str, str], set[str]]:
+    index: dict[tuple[str, str], set[str]] = defaultdict(set)
+    if not path.exists():
+        return index
+    with path.open(encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            root_product_code = clean_text(row["root_product_code"])
+            component_code = normalize_reference_material_code(row["component_code"])
+            substitute_material_code = normalize_reference_material_code(row["substitute_material_code"])
+            if not root_product_code or not component_code or not substitute_material_code:
+                continue
+            if component_code == substitute_material_code:
+                continue
+            index[(root_product_code, component_code)].add(substitute_material_code)
+    return index
 
 
 def resolve_custom_code_basis(row: dict[str, object]) -> str:
@@ -306,8 +378,10 @@ def bucket_candidate_class(
 def build_replacement_basis(
     shared_normalized_dir: Path,
     shipment_dir: Path,
+    shipment_slug_value: str | None = None,
 ) -> list[ReplacementBasisBucket]:
-    admissibility_path = shipment_dir / "normalized" / f"{shipment_dir.name}-variant-admissibility.csv"
+    slug_value = shipment_slug_value or shipment_dir.name
+    admissibility_path = shipment_dir / "normalized" / f"{slug_value}-variant-admissibility.csv"
     scope_index = load_variant_scope_index(admissibility_path)
     buckets: list[ReplacementBasisBucket] = []
 
@@ -604,6 +678,57 @@ def build_virtual_basis_buckets(
     return virtual_buckets
 
 
+def build_virtual_material_buckets(
+    target_material: MaterialState,
+    stock_by_material: dict[str, list[ReplacementBasisBucket]],
+    allowed_material_codes: set[str],
+) -> list[ReplacementBasisBucket]:
+    released_qty_by_bucket = defaultdict(float)
+    for allocation in target_material.active_allocations:
+        released_qty_by_bucket[allocation.bucket_id] += allocation.allocated_qty
+
+    virtual_buckets: list[ReplacementBasisBucket] = []
+    for material_code in sorted(allowed_material_codes):
+        for bucket in stock_by_material.get(material_code, []):
+            clone = copy.copy(bucket)
+            clone.remaining_qty += released_qty_by_bucket.get(bucket.bucket_id, 0.0)
+            virtual_buckets.append(clone)
+    return virtual_buckets
+
+
+def build_candidate_pool(
+    target_material: MaterialState,
+    export_line: object,
+    stock_by_material: dict[str, list[ReplacementBasisBucket]],
+    stock_by_basis: dict[str, list[ReplacementBasisBucket]],
+    replacement_mode: str,
+    explicit_substitute_index: dict[tuple[str, str], set[str]] | None,
+) -> tuple[str, list[ReplacementBasisBucket], set[str]]:
+    custom_code_basis = target_material.custom_code_basis or target_material.original_material_code
+    if replacement_mode == REPLACEMENT_MODE_TECHNICAL_REFERENCE:
+        explicit_candidates = set(
+            (explicit_substitute_index or {}).get(
+                (export_line.model_code, target_material.original_material_code),
+                set(),
+            )
+        )
+        allowed_material_codes = {target_material.original_material_code, *explicit_candidates}
+        return (
+            custom_code_basis,
+            build_virtual_material_buckets(
+                target_material,
+                stock_by_material,
+                allowed_material_codes,
+            ),
+            explicit_candidates,
+        )
+    return (
+        custom_code_basis,
+        build_virtual_basis_buckets(target_material, stock_by_basis),
+        set(),
+    )
+
+
 def allocations_changed(material: MaterialState, allocations: list[BucketAllocation]) -> bool:
     current = [
         (
@@ -771,9 +896,18 @@ def build_material_plan(
     staff_substitutes: set[tuple[str, str]],
     import_lead_days: int,
     max_import_age_days: int,
+    stock_by_material: dict[str, list[ReplacementBasisBucket]] | None = None,
+    replacement_mode: str = REPLACEMENT_MODE_HEURISTIC_CUSTOM_BASIS,
+    explicit_substitute_index: dict[tuple[str, str], set[str]] | None = None,
 ) -> MaterialPlan | None:
-    custom_code_basis = target_material.custom_code_basis or target_material.original_material_code
-    virtual_buckets = build_virtual_basis_buckets(target_material, stock_by_basis)
+    custom_code_basis, virtual_buckets, _ = build_candidate_pool(
+        target_material,
+        export_line,
+        stock_by_material or {},
+        stock_by_basis,
+        replacement_mode,
+        explicit_substitute_index,
+    )
     eligible_buckets = [
         bucket
         for bucket in virtual_buckets
@@ -896,13 +1030,24 @@ def build_candidate_rows(
     staff_substitutes: set[tuple[str, str]],
     import_lead_days: int,
     max_import_age_days: int,
+    stock_by_material: dict[str, list[ReplacementBasisBucket]] | None = None,
+    replacement_mode: str = REPLACEMENT_MODE_HEURISTIC_CUSTOM_BASIS,
+    explicit_substitute_index: dict[tuple[str, str], set[str]] | None = None,
 ) -> list[dict[str, object]]:
-    custom_code_basis = target_material.custom_code_basis or target_material.original_material_code
-    virtual_buckets = build_virtual_basis_buckets(target_material, stock_by_basis)
+    custom_code_basis, virtual_buckets, explicit_candidates = build_candidate_pool(
+        target_material,
+        export_line,
+        stock_by_material or {},
+        stock_by_basis,
+        replacement_mode,
+        explicit_substitute_index,
+    )
     by_candidate: dict[str, list[tuple[ReplacementBasisBucket, str, tuple[str, ...]]]] = defaultdict(list)
     for bucket in virtual_buckets:
         candidate_material_code = bucket.candidate_material_code or bucket.erp_material_code
         if candidate_material_code == target_material.original_material_code:
+            continue
+        if replacement_mode == REPLACEMENT_MODE_TECHNICAL_REFERENCE and candidate_material_code not in explicit_candidates:
             continue
         include, review_scope, risk_flags = bucket_review_scope(
             baseline,
@@ -1285,6 +1430,9 @@ def run_starting_point(
     import_lead_days: int,
     max_import_age_days: int,
     output_dir: Path,
+    replacement_mode: str = REPLACEMENT_MODE_HEURISTIC_CUSTOM_BASIS,
+    explicit_substitute_index: dict[tuple[str, str], set[str]] | None = None,
+    collect_candidate_rows: bool = True,
 ) -> dict[str, object]:
     stock_by_material = {
         code: [copy.copy(bucket) for bucket in buckets]
@@ -1344,20 +1492,24 @@ def run_starting_point(
                     variant_id=variant.variant_id,
                     declaration_no=export_line.declaration_no,
                 )
-                for row in build_candidate_rows(
-                    baseline,
-                    context,
-                    export_line,
-                    variant,
-                    materials,
-                    current_snapshot,
-                    material,
-                    stock_by_basis,
-                    staff_substitutes,
-                    import_lead_days,
-                    max_import_age_days,
-                ):
-                    candidate_rows_by_key[candidate_row_key(row)] = row
+                if collect_candidate_rows:
+                    for row in build_candidate_rows(
+                        baseline,
+                        context,
+                        export_line,
+                        variant,
+                        materials,
+                        current_snapshot,
+                        material,
+                        stock_by_basis,
+                        staff_substitutes,
+                        import_lead_days,
+                        max_import_age_days,
+                        stock_by_material=stock_by_material,
+                        replacement_mode=replacement_mode,
+                        explicit_substitute_index=explicit_substitute_index,
+                    ):
+                        candidate_rows_by_key[candidate_row_key(row)] = row
                 plan = build_material_plan(
                     baseline,
                     export_line,
@@ -1369,6 +1521,9 @@ def run_starting_point(
                     staff_substitutes,
                     import_lead_days,
                     max_import_age_days,
+                    stock_by_material=stock_by_material,
+                    replacement_mode=replacement_mode,
+                    explicit_substitute_index=explicit_substitute_index,
                 )
                 if plan is not None and plan_improves(plan, current_snapshot):
                     material_plans.append(plan)
@@ -1432,6 +1587,7 @@ def run_starting_point(
         snapshot_payload = {
             "shipment_id": shipment_id,
             "starting_point_id": starting_point_id,
+            "replacement_mode": replacement_mode,
             "sequence_no": sequence_no,
             "model_code": export_line.model_code,
             "variant_id": variant.variant_id,
@@ -1520,6 +1676,7 @@ def run_starting_point(
         "product_status": final_products,
         "final_bom_state_after_full_run": final_products,
         "metadata": {
+            "replacement_mode": replacement_mode,
             "future_runtime_selectable": [
                 "bom_selection_strategy",
                 "sequence_strategy",
@@ -2520,6 +2677,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case-dir", type=Path, default=DEFAULT_CASE_DIR)
     parser.add_argument("--shipment", default=DEFAULT_SHIPMENT)
+    parser.add_argument("--workspace-dir", type=Path)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--replacement-mode",
+        choices=replacement_mode_choices(),
+        default=REPLACEMENT_MODE_HEURISTIC_CUSTOM_BASIS,
+    )
+    parser.add_argument("--substitute-reference-path", type=Path)
+    parser.add_argument("--skip-candidate-export", action="store_true")
     parser.add_argument("--output-doc", type=Path, default=DEFAULT_DOC)
     return parser.parse_args()
 
@@ -2528,11 +2694,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     baseline = load_baseline_module()
     policy = resolve_shipment_policy(args.case_dir, args.shipment)
     shared_normalized_dir = args.case_dir / "shared" / "normalized"
-    shipment_dir = args.case_dir / shipment_slug(args.shipment)
-    results_dir = shipment_dir / "results"
+    substitute_reference_path = args.substitute_reference_path or (
+        technical_priority_artifact_dir(args.case_dir)
+        / "substitute-reference"
+        / "explicit-substitute-links.csv"
+    )
+    shipment_slug_value = shipment_slug(args.shipment)
+    shipment_dir = args.workspace_dir or (args.case_dir / shipment_slug_value)
+    workspace_results_dir = shipment_dir / "results"
+    results_dir = args.output_dir or workspace_results_dir
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    _, variants_by_model = baseline.load_dm_variants(shared_normalized_dir)
+    variants_by_model = load_workspace_variants(shipment_dir / "normalized")
     export_rows = baseline.load_export_rows(shared_normalized_dir, {args.shipment})
     if args.shipment not in export_rows:
         raise SystemExit(f"Shipment not found in normalized exports: {args.shipment}")
@@ -2547,18 +2720,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         for item in items:
             variant_by_id[item.variant_id] = item
 
-    basis_buckets = build_replacement_basis(shared_normalized_dir, shipment_dir)
+    basis_buckets = build_replacement_basis(shared_normalized_dir, shipment_dir, shipment_slug_value)
     stock_by_material, stock_by_basis, bucket_by_id = clone_stock_indexes(basis_buckets)
     material_basis_stats = build_material_basis_stats(basis_buckets)
     staff_substitutes = read_staff_substitutes()
+    explicit_substitute_index = load_explicit_substitute_index(substitute_reference_path)
 
-    baseline_starting_points_path = results_dir / "baseline-starting-points.json"
+    baseline_starting_points_path = workspace_results_dir / "baseline-starting-points.json"
     starting_points_payload = json.loads(baseline_starting_points_path.read_text(encoding="utf-8"))[args.shipment]
     starting_points_payload, starting_point_analysis = extend_starting_points_with_heuristics(
         baseline,
         args.shipment,
         starting_points_payload,
-        results_dir / "baseline-scenarios.json",
+        workspace_results_dir / "baseline-scenarios.json",
         export_rows[args.shipment],
         export_lookup,
         stock_by_basis,
@@ -2653,6 +2827,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             import_lead_days=policy.import_lead_days,
             max_import_age_days=policy.max_import_age_days,
             output_dir=results_dir,
+            replacement_mode=args.replacement_mode,
+            explicit_substitute_index=explicit_substitute_index,
+            collect_candidate_rows=not args.skip_candidate_export,
         )
         seed_results.append(result["seed_summary"])
         candidate_rows_by_seed[starting_point_id] = result["candidate_rows"]
@@ -2908,6 +3085,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             {
                 "shipment_id": args.shipment,
                 "policy_version": policy.policy_version,
+                "workspace_dir": str(shipment_dir),
+                "output_dir": str(results_dir),
+                "replacement_mode": args.replacement_mode,
+                "skip_candidate_export": args.skip_candidate_export,
+                "substitute_reference_path": str(substitute_reference_path),
                 "seed_summaries": seed_results,
                 "candidate_tables": {key: str(value) for key, value in candidate_csvs.items()},
                 "review_workbook": str(workbook_path),
@@ -2930,8 +3112,21 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "import_lead_days": policy.import_lead_days,
                 "max_import_age_days": policy.max_import_age_days,
                 "valuation_mode": policy.valuation_mode,
-                "review_scope": "same_custom_code_clean_plus_ambiguity_plus_no_lookup_plus_date_blocked",
-                "commit_scope": "same_custom_code_clean_plus_ambiguity_plus_no_lookup",
+                "workspace_dir": str(shipment_dir),
+                "output_dir": str(results_dir),
+                "replacement_mode": args.replacement_mode,
+                "skip_candidate_export": args.skip_candidate_export,
+                "substitute_reference_path": str(substitute_reference_path),
+                "review_scope": (
+                    "explicit_substitute_reference_plus_date_blocked_plus_ambiguity"
+                    if args.replacement_mode == REPLACEMENT_MODE_TECHNICAL_REFERENCE
+                    else "same_custom_code_clean_plus_ambiguity_plus_no_lookup_plus_date_blocked"
+                ),
+                "commit_scope": (
+                    "explicit_substitute_reference_plus_ambiguity_plus_no_lookup"
+                    if args.replacement_mode == REPLACEMENT_MODE_TECHNICAL_REFERENCE
+                    else "same_custom_code_clean_plus_ambiguity_plus_no_lookup"
+                ),
                 "future_runtime_selectable": [
                     "bom_selection_strategy",
                     "sequence_strategy",

@@ -13,10 +13,16 @@ from datetime import date, datetime, timedelta
 from itertools import product
 from pathlib import Path
 
+from growatt_bom_sources import (
+    DEFAULT_CASE_DIR,
+    DM_BOM_SOURCE_ID,
+    bom_source_choices,
+    relative_to_case,
+    resolve_bom_source,
+)
 from growatt_case_config import resolve_shipment_policy
 
 
-DEFAULT_CASE_DIR = Path("data/cases/growatt-rvc-20260421")
 DEFAULT_SHIPMENTS = ("GIN01426B282",)
 TARGET_RVC = 35.0
 VN_ORIGINS = {"VIETNAM", "VIỆT NAM", "VN"}
@@ -215,9 +221,9 @@ def is_vietnam_origin(origin: str | None) -> bool:
     return normalize_origin(origin) in VN_ORIGINS
 
 
-def load_dm_variants(normalized_dir: Path) -> tuple[list[BomVariant], dict[str, list[BomVariant]]]:
+def load_bom_variants(variant_csv_path: Path) -> tuple[list[BomVariant], dict[str, list[BomVariant]]]:
     rows_by_variant: dict[str, list[dict[str, str]]] = defaultdict(list)
-    with (normalized_dir / "dm-variants.csv").open(encoding="utf-8") as handle:
+    with variant_csv_path.open(encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             rows_by_variant[clean_text(row["bom_variant_id"])].append(row)
 
@@ -230,7 +236,7 @@ def load_dm_variants(normalized_dir: Path) -> tuple[list[BomVariant], dict[str, 
             BomLine(
                 material_code=clean_text(row["material_code"]),
                 qty_per_unit=parse_numeric(row["qty_per_unit"]),
-                row_no=parse_int(row["dm_row_no"]),
+                row_no=parse_int(row.get("dm_row_no") or row.get("source_row_no")),
                 ordinal_key=clean_text(row["ordinal_key"]),
             )
             for row in rows
@@ -290,9 +296,14 @@ def load_export_rows(normalized_dir: Path, shipment_ids: set[str]) -> dict[str, 
     return shipments
 
 
-def load_candidate_admissibility(case_dir: Path, shipment_id: str) -> dict[tuple[str, str], set[str]]:
+def load_candidate_admissibility(
+    case_dir: Path,
+    shipment_id: str,
+    workspace_dir: Path | None = None,
+) -> dict[tuple[str, str], set[str]]:
     slug = shipment_slug(shipment_id)
-    admissibility_path = case_dir / slug / "normalized" / f"{slug}-variant-admissibility.csv"
+    shipment_workspace_dir = workspace_dir or (case_dir / slug)
+    admissibility_path = shipment_workspace_dir / "normalized" / f"{slug}-variant-admissibility.csv"
     if not admissibility_path.exists():
         raise SystemExit(f"Missing admissibility artifact: {admissibility_path}")
 
@@ -648,7 +659,7 @@ def print_shipment_summary(
         )
         for variant in options:
             print(
-                f"  option {variant.variant_id} | bom_code={variant.bom_code} | dm_rows={variant.start_row}-{variant.end_row} | "
+                f"  option {variant.variant_id} | bom_code={variant.bom_code} | rows={variant.start_row}-{variant.end_row} | "
                 f"line_count={variant.line_count}"
             )
 
@@ -860,6 +871,12 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_SHIPMENTS),
         help="Shipment invoice ids such as GIN01426B282",
     )
+    parser.add_argument(
+        "--bom-source",
+        choices=bom_source_choices(),
+        default=DM_BOM_SOURCE_ID,
+    )
+    parser.add_argument("--workspace-dir", type=Path)
     parser.add_argument("--config-path", type=Path)
     parser.add_argument(
         "--valuation-mode",
@@ -877,8 +894,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     shipment_ids = set(args.shipments)
+    if args.workspace_dir is not None and len(shipment_ids) != 1:
+        raise SystemExit("--workspace-dir can only be used with a single shipment")
+
     shared_normalized_dir = args.case_dir / "shared" / "normalized"
-    _, variants_by_model = load_dm_variants(shared_normalized_dir)
+    bom_source = resolve_bom_source(args.case_dir, args.bom_source)
+    _, variants_by_model = load_bom_variants(bom_source.variant_csv_path)
     export_rows = load_export_rows(shared_normalized_dir, shipment_ids)
 
     all_results: dict[str, list[ShipmentScenarioResult]] = {}
@@ -896,7 +917,12 @@ def main() -> None:
             max_import_age_days_override=args.max_import_age_days,
             valuation_mode_override=args.valuation_mode,
         )
-        candidate_admissibility = load_candidate_admissibility(args.case_dir, shipment_id)
+        shipment_workspace_dir = args.workspace_dir or (args.case_dir / shipment_slug(shipment_id))
+        candidate_admissibility = load_candidate_admissibility(
+            args.case_dir,
+            shipment_id,
+            workspace_dir=shipment_workspace_dir,
+        )
         stock_snapshot = load_stock_snapshot(shared_normalized_dir, candidate_admissibility)
         scenario_results, variant_options = enumerate_shipment_scenarios(
             shipment_id=shipment_id,
@@ -928,7 +954,7 @@ def main() -> None:
         )
 
         write_case_workspace(
-            shipment_dir=args.case_dir / shipment_slug(shipment_id),
+            shipment_dir=shipment_workspace_dir,
             export_rows={shipment_id: export_rows[shipment_id]},
             variants_by_model=variant_options,
             stock_snapshot=stock_snapshot,
@@ -937,20 +963,33 @@ def main() -> None:
             run_config={
                 "stage": "baseline",
                 **policy.to_dict(),
+                "bom_source_id": bom_source.source_id,
+                "bom_source_label": bom_source.label,
+                "bom_source_variant_csv": relative_to_case(args.case_dir, bom_source.variant_csv_path),
+                "bom_reference_comparison": relative_to_case(
+                    args.case_dir,
+                    bom_source.comparison_summary_path,
+                ),
+                "workspace_dir": relative_to_case(args.case_dir, shipment_workspace_dir),
                 "starting_points": {
                     "heuristic_best": {
                         "variant_strategy": "global_best_after_exhaustive_sort",
                         "sequence_strategy": "declaration_order",
                     },
                     "staff_latest_bom_invoice_order": {
-                        "variant_strategy": "latest_dm_block_per_model",
+                        "variant_strategy": (
+                            "latest_dm_block_per_model"
+                            if bom_source.source_id == DM_BOM_SOURCE_ID
+                            else "canonical_variant_per_model"
+                        ),
                         "sequence_strategy": "invoice_then_declaration",
                     },
                 },
             },
         )
         print(
-            f"Wrote case workspace {args.case_dir / shipment_slug(shipment_id)}"
+            f"Wrote case workspace {shipment_workspace_dir}"
+            f" | bom_source={bom_source.source_id}"
             f" | policy={policy.policy_version}"
             f" | valuation_mode={policy.valuation_mode}"
             f" | import_lead_days={policy.import_lead_days}"

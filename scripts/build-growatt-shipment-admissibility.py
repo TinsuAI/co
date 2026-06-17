@@ -11,10 +11,16 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from growatt_bom_sources import (
+    DEFAULT_CASE_DIR,
+    DM_BOM_SOURCE_ID,
+    bom_source_choices,
+    relative_to_case,
+    resolve_bom_source,
+)
 from growatt_case_config import resolve_shipment_policy
 
 
-DEFAULT_CASE_DIR = Path("data/cases/growatt-rvc-20260421")
 DEFAULT_SHIPMENT = "GIN01426B282"
 
 
@@ -40,6 +46,12 @@ class VariantLine:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case-dir", type=Path, default=DEFAULT_CASE_DIR)
+    parser.add_argument(
+        "--bom-source",
+        choices=bom_source_choices(),
+        default=DM_BOM_SOURCE_ID,
+    )
+    parser.add_argument("--workspace-dir", type=Path)
     parser.add_argument("--config-path", type=Path)
     parser.add_argument("--shipment", default=DEFAULT_SHIPMENT)
     parser.add_argument("--policy-version")
@@ -137,11 +149,14 @@ def load_exports(exports_path: Path, shipment_id: str) -> list[ExportLine]:
     return rows
 
 
-def load_variant_lines(dm_path: Path, export_models: set[str]) -> tuple[dict[str, list[VariantLine]], dict[str, str]]:
+def load_variant_lines(
+    variant_csv_path: Path,
+    export_models: set[str],
+) -> tuple[dict[str, list[VariantLine]], dict[str, str]]:
     variant_lines: dict[str, list[VariantLine]] = defaultdict(list)
     variant_to_model: dict[str, str] = {}
 
-    with dm_path.open(encoding="utf-8") as handle:
+    with variant_csv_path.open(encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             bom_code = clean_text(row["bom_code"])
             export_model = next(
@@ -180,9 +195,10 @@ def main() -> None:
         max_import_age_days_override=args.max_import_age_days,
     )
     shared_dir = args.case_dir / "shared" / "normalized"
-    shipment_dir = args.case_dir / shipment_slug(args.shipment)
-    normalized_dir = shipment_dir / "normalized"
+    workspace_dir = args.workspace_dir or (args.case_dir / shipment_slug(args.shipment))
+    normalized_dir = workspace_dir / "normalized"
     normalized_dir.mkdir(parents=True, exist_ok=True)
+    bom_source = resolve_bom_source(args.case_dir, args.bom_source)
 
     exports = load_exports(shared_dir / "exports-normalized.csv", args.shipment)
     if not exports:
@@ -190,9 +206,14 @@ def main() -> None:
 
     export_models = {row.model_code for row in exports}
     export_by_model = {row.model_code: row for row in exports}
-    variant_lines, variant_to_model = load_variant_lines(shared_dir / "dm-variants.csv", export_models)
+    variant_lines, variant_to_model = load_variant_lines(
+        bom_source.variant_csv_path,
+        export_models,
+    )
     if not variant_lines:
-        raise SystemExit(f"No DM variants found for shipment models in {args.shipment}")
+        raise SystemExit(
+            f"No BOM variants found for shipment models in {args.shipment} from {bom_source.variant_csv_path}"
+        )
 
     variant_materials = {
         variant_id: {line.material_code for line in lines}
@@ -432,10 +453,19 @@ def main() -> None:
         {
             "stage": "shipment-admissibility",
             **policy.to_dict(),
+            "bom_source_id": bom_source.source_id,
+            "bom_source_label": bom_source.label,
+            "bom_source_variant_csv": relative_to_case(args.case_dir, bom_source.variant_csv_path),
+            "bom_reference_comparison": relative_to_case(
+                args.case_dir,
+                bom_source.comparison_summary_path,
+            ),
+            "workspace_dir": relative_to_case(args.case_dir, workspace_dir),
         },
     )
 
     print(f"Wrote admissibility artifacts to {normalized_dir}")
+    print(f"BOM source: {bom_source.source_id} ({bom_source.label})")
     print(
         "Policy:"
         f" {policy.policy_version}"
