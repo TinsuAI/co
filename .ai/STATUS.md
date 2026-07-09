@@ -26,7 +26,7 @@
   **CHƯA verify trên deployed:** nhánh success có refresh token hợp lệ (200 + rotation) — mint credential
   trên DH live bị **permission classifier chặn**; 3 phương án ghi ở Open items của session summary.
   **GIT: 2 commit cuối phiên (docs handoff + guardrail) đã PUSH lên `origin/main`** — docs/hook only, không đổi
-  app, CI chỉ chạy lại `Deploy demo`. Nhánh `fix/session-expiry-xhr-401` đã merged, chưa xoá (local+remote).
+  app, CI chỉ chạy lại `Deploy demo`. Nhánh `fix/session-expiry-xhr-401` đã merged và **đã xoá** (local+remote).
   **Guardrail đã đổi:** `git push` và `gh pr merge` giờ **hỏi xác nhận** (PreToolUse `permissionDecision: "ask"`)
   thay vì bị chặn cứng — agent push/merge được nhưng user duyệt từng lần; các lệnh phá huỷ (hard reset, forced
   clean, force-delete branch, whole-tree checkout/restore, **force-push**) vẫn **chặn cứng**, và được kiểm TRƯỚC
