@@ -2013,12 +2013,14 @@
         <h2 id="origin-substitute-modal-title">Tìm NVL thay thế</h2>
         <p class="meta" data-origin-substitute-modal-target>—</p>
         <div class="origin-substitute-current" data-origin-substitute-current hidden>
-          <div><span>Mã</span><strong class="mono" data-current-field="code">—</strong></div>
-          <div><span>Tên</span><strong data-current-field="name">—</strong></div>
-          <div><span>ĐM</span><strong class="num" data-current-field="norm">—</strong> <em data-current-field="uom"></em></div>
-          <div><span>Lượng dùng</span><strong class="num" data-current-field="consumed">—</strong></div>
-          <div><span>Đơn giá</span><strong class="num" data-current-field="unit_value">—</strong> <em data-current-field="currency"></em></div>
-          <div><span>Trị giá NVL</span><strong class="num" data-current-field="material_value">—</strong></div>
+          <p class="origin-substitute-current-name"><strong data-current-field="name">—</strong></p>
+          <div class="origin-substitute-current-meta">
+            <div><span>Mã</span><strong class="mono" data-current-field="code">—</strong></div>
+            <div><span>ĐM</span><strong class="num" data-current-field="norm">—</strong> <em data-current-field="uom"></em></div>
+            <div><span>Lượng dùng</span><strong class="num" data-current-field="consumed">—</strong></div>
+            <div><span>Đơn giá</span><strong class="num" data-current-field="unit_value">—</strong> <em data-current-field="currency"></em></div>
+            <div><span>Trị giá NVL</span><strong class="num" data-current-field="material_value">—</strong></div>
+          </div>
         </div>
       </div>
       <button type="button" class="btn-secondary" data-origin-substitute-modal-close aria-label="Đóng modal">×</button>
@@ -3830,6 +3832,11 @@
       button.addEventListener("click", () => activateTab(button.dataset.originSubstituteTabTrigger || "recommended"));
     });
 
+    const setCurrentFieldText = (el, text) => {
+      el.textContent = text;
+      if (el.dataset.currentField === "name") el.title = text === "—" ? "" : text;
+    };
+
     const populateCurrentStrip = (row, override) => {
       if (!currentStrip) return;
       if (!row && !override) {
@@ -3840,7 +3847,7 @@
         currentStrip.hidden = false;
         Object.entries(override).forEach(([key, value]) => {
           const el = currentField(key);
-          if (el) el.textContent = (value == null || value === "") ? "—" : value;
+          if (el) setCurrentFieldText(el, (value == null || value === "") ? "—" : value);
         });
         return;
       }
@@ -3864,7 +3871,7 @@
       };
       Object.entries(fields).forEach(([key, value]) => {
         const el = currentField(key);
-        if (el) el.textContent = value;
+        if (el) setCurrentFieldText(el, value);
       });
     };
 

@@ -5533,18 +5533,42 @@ body.co-stock-history-modal-open { overflow: hidden; }
 
 .origin-substitute-current {
   margin-top: 0.35rem;
-  display: grid;
-  grid-template-columns: minmax(7rem, 0.8fr) minmax(12rem, 1.4fr) repeat(4, minmax(5rem, auto));
-  gap: 0.25rem 0.45rem;
-  padding: 0.35rem 0.45rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.4rem 0.5rem;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-subtle);
-  align-items: center;
   max-width: 100%;
 }
 
-.origin-substitute-current > div {
+.origin-substitute-current-name {
+  margin: 0;
+  min-width: 0;
+}
+
+.origin-substitute-current-name strong {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 0.92rem;
+  line-height: 1.35;
+  font-weight: 600;
+  color: var(--foreground);
+  word-break: break-word;
+}
+
+.origin-substitute-current-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2rem 0.9rem;
+  min-width: 0;
+}
+
+.origin-substitute-current-meta > div {
   display: inline-flex;
   align-items: baseline;
   gap: 0.25rem;
@@ -5553,7 +5577,7 @@ body.co-stock-history-modal-open { overflow: hidden; }
   white-space: nowrap;
 }
 
-.origin-substitute-current span {
+.origin-substitute-current-meta span {
   flex: 0 0 auto;
   color: var(--foreground-muted);
   font-size: 0.65rem;
@@ -5561,7 +5585,7 @@ body.co-stock-history-modal-open { overflow: hidden; }
   letter-spacing: 0;
 }
 
-.origin-substitute-current strong {
+.origin-substitute-current-meta strong {
   flex: 1 1 auto;
   font-size: 0.8rem;
   color: var(--foreground);
@@ -5571,7 +5595,7 @@ body.co-stock-history-modal-open { overflow: hidden; }
   white-space: nowrap;
 }
 
-.origin-substitute-current em {
+.origin-substitute-current-meta em {
   flex: 0 0 auto;
   font-style: normal;
   color: var(--foreground-muted);
@@ -5738,11 +5762,11 @@ body.co-stock-history-modal-open { overflow: hidden; }
     border-radius: 0;
   }
 
-  .origin-substitute-current {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .origin-substitute-current-meta {
+    gap: 0.2rem 0.6rem;
   }
 
-  .origin-substitute-current > div {
+  .origin-substitute-current-meta > div {
     gap: 0.2rem;
   }
 
